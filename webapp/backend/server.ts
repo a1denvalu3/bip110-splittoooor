@@ -46,10 +46,9 @@ const EXPLORER_CACHE_TTL = {
     fees: cacheTtl('EXPLORER_FEE_CACHE_SECONDS', 60)
 };
 
-// The production backend is exposed through a reverse proxy on the same host.
-// Trust forwarded client addresses only when the direct peer is loopback, so the
-// API rate limiter remains per-client without accepting spoofed headers remotely.
-app.set('trust proxy', 'loopback');
+// The production backend is exactly one hop behind nginx. This also covers the
+// Docker bridge address seen when nginx proxies to a loopback-published port.
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
 
