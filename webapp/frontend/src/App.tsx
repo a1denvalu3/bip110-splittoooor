@@ -1289,13 +1289,15 @@ export default function App() {
     const keyPrefix = networkMode === 'mainnet' ? 'mainnet' : 'regtest';
     const net = getNetwork();
 
-    let masterPriv = sessionStorage.getItem(`${keyPrefix}_master_privkey`);
+    let masterPriv = localStorage.getItem(`${keyPrefix}_master_privkey`);
     let activeIdx = parseInt(localStorage.getItem(`${keyPrefix}_active_index`) || '0', 10);
     let maxIdx = parseInt(localStorage.getItem(`${keyPrefix}_max_index`) || '0', 10);
 
     if (!masterPriv) {
-      // Migrate pre-existing non-master private key to master if exists, or generate a fresh one
-      const oldPriv = localStorage.getItem(`${keyPrefix}_master_privkey`) || localStorage.getItem(`${keyPrefix}_bip110_privkey`);
+      // Migrate legacy session-scoped or pre-master keys if present, or generate a fresh one
+      const oldPriv = sessionStorage.getItem(`${keyPrefix}_master_privkey`)
+        || sessionStorage.getItem(`${keyPrefix}_bip110_privkey`)
+        || localStorage.getItem(`${keyPrefix}_bip110_privkey`);
       if (oldPriv) {
         masterPriv = oldPriv;
       } else {
@@ -1304,13 +1306,13 @@ export default function App() {
       }
       activeIdx = 0;
       maxIdx = 0;
-      sessionStorage.setItem(`${keyPrefix}_master_privkey`, masterPriv);
+      localStorage.setItem(`${keyPrefix}_master_privkey`, masterPriv);
       localStorage.setItem(`${keyPrefix}_active_index`, '0');
       localStorage.setItem(`${keyPrefix}_max_index`, '0');
     }
-    // Remove legacy persistent plaintext secrets after one-time migration.
-    localStorage.removeItem(`${keyPrefix}_master_privkey`);
-    localStorage.removeItem(`${keyPrefix}_bip110_privkey`);
+    // Remove legacy session-scoped plaintext secrets after one-time migration.
+    sessionStorage.removeItem(`${keyPrefix}_master_privkey`);
+    sessionStorage.removeItem(`${keyPrefix}_bip110_privkey`);
 
     setMasterPrivateKey(masterPriv);
     setActiveIndex(activeIdx);
@@ -1534,7 +1536,7 @@ export default function App() {
         setActiveIndex(activeIdx);
         setMaxIndex(maxIdx);
 
-        sessionStorage.setItem(`${keyPrefix}_master_privkey`, masterPriv);
+        localStorage.setItem(`${keyPrefix}_master_privkey`, masterPriv);
         localStorage.setItem(`${keyPrefix}_active_index`, String(activeIdx));
         localStorage.setItem(`${keyPrefix}_max_index`, String(maxIdx));
 
@@ -1580,7 +1582,7 @@ export default function App() {
       localStorage.setItem(`${keyPrefix}_active_index`, String(newMaxIndex));
       localStorage.setItem(`${keyPrefix}_max_index`, String(newMaxIndex));
 
-      sessionStorage.setItem(`${keyPrefix}_bip110_privkey`, activeKeys.privateKey);
+      localStorage.setItem(`${keyPrefix}_bip110_privkey`, activeKeys.privateKey);
       localStorage.setItem(`${keyPrefix}_bip110_pubkey`, activeKeys.publicKey);
       localStorage.setItem(`${keyPrefix}_bip110_address`, activeKeys.splitAddress);
       
@@ -1608,7 +1610,7 @@ export default function App() {
 
     localStorage.setItem(`${keyPrefix}_active_index`, String(index));
 
-    sessionStorage.setItem(`${keyPrefix}_bip110_privkey`, activeKeys.privateKey);
+    localStorage.setItem(`${keyPrefix}_bip110_privkey`, activeKeys.privateKey);
     localStorage.setItem(`${keyPrefix}_bip110_pubkey`, activeKeys.publicKey);
     localStorage.setItem(`${keyPrefix}_bip110_address`, activeKeys.splitAddress);
 
@@ -2211,7 +2213,7 @@ export default function App() {
       });
 
       // Save preimage locally associated with Offer ID so we can claim later
-      sessionStorage.setItem(`preimage_${res.data.id}`, preimageHex);
+      localStorage.setItem(`preimage_${res.data.id}`, preimageHex);
 
       showToast('Swap offer published successfully to the marketplace!', 'success');
       setSelectedBackingChain('');
@@ -2297,7 +2299,8 @@ export default function App() {
         const firstHtlcLockTime = deadlineFromHeight(currentHeight, validateLockTimeOffset(selectedOffer.lockTimeOffset));
 
         // F2: only fund offers whose preimage was generated on this device.
-        const localPreimage = sessionStorage.getItem(`preimage_${selectedOffer.id}`);
+        const localPreimage = localStorage.getItem(`preimage_${selectedOffer.id}`)
+          || sessionStorage.getItem(`preimage_${selectedOffer.id}`);
         if (!localPreimage) {
           throw new Error('No local preimage for this offer — refusing to fund an offer this device did not create');
         }
@@ -2560,9 +2563,10 @@ export default function App() {
           throw new Error(`CRITICAL SECURITY WARNING: The acceptor funded the HTLC with only ${(utxo.amount / 100000000).toFixed(4)} ${targetChain === 'main' ? 'BTC' : 'B110'}, but the agreed amount was ${(requiredAmount / 100000000).toFixed(4)}! Do NOT release the preimage!`);
         }
 
-        // Retrieve local preimage securely stored
-        const savedPreimage = sessionStorage.getItem(`preimage_${selectedOffer.id}`);
-        if (!savedPreimage) throw new Error("Cryptographic preimage not found in secure local storage.");
+        // Retrieve locally persisted preimage
+        const savedPreimage = localStorage.getItem(`preimage_${selectedOffer.id}`)
+          || sessionStorage.getItem(`preimage_${selectedOffer.id}`);
+        if (!savedPreimage) throw new Error("Cryptographic preimage not found in local storage.");
 
         // Build and sign claim transaction locally!
         const keyPair = getKeyPairForPubKey(selectedOffer.initiatorPubKey, net);
