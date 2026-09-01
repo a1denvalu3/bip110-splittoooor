@@ -125,6 +125,28 @@ export class MempoolExplorerClient {
         }
     }
 
+    // Esplora outspend lookup. Returns null when the transaction does not
+    // exist on this chain at all (404), meaning the outpoint is chain-exclusive.
+    async getOutspend(txid: string, vout: number): Promise<{ spent: boolean; confirmed: boolean } | null> {
+        try {
+            const response = await this.http.get(this.api(`/tx/${encodeURIComponent(txid)}/outspend/${vout}`), {
+                timeout: this.timeoutMs
+            });
+            if (typeof response.data?.spent !== 'boolean') {
+                throw new Error('Explorer returned an invalid outspend response');
+            }
+            const confirmed = response.data.spent
+                ? response.data.status?.confirmed === true
+                : false;
+            return { spent: response.data.spent, confirmed };
+        } catch (error) {
+            if (error instanceof ExplorerRequestError) throw error;
+            const status = (error as AxiosError).response?.status;
+            if (status === 404) return null;
+            throw new ExplorerRequestError('Outspend lookup', error);
+        }
+    }
+
     async broadcastTransaction(hex: string): Promise<string> {
         try {
             const response = await this.http.post(this.api('/tx'), hex, {
@@ -215,6 +237,84 @@ export class MempoolExplorerClient {
                 new Error(`Mempool endpoint failed: ${mempoolDetail}; Esplora endpoint failed: ${esploraDetail}`)
             );
         }
+    }
+
+    async assertHealthy(name: string): Promise<void> {
+        await Promise.all([this.getTipHeight(), this.getRecommendedFees()]);
+        console.log(`[BOOT] ${name} explorer health check passed: ${this.baseUrl}`);
+    }
+}
+
+export class RotatingExplorerClient {
+    readonly sourceId: string;
+    private activeIndex = 0;
+
+    constructor(
+        private readonly clients: MempoolExplorerClient[],
+        private readonly onRotate?: (from: string, to: string, error: unknown) => void
+    ) {
+        if (clients.length === 0) throw new Error('At least one explorer endpoint is required');
+        this.sourceId = clients.map(client => client.baseUrl).join(',');
+    }
+
+    get baseUrl(): string {
+        return this.clients[this.activeIndex].baseUrl;
+    }
+
+    private async request<T>(operation: (client: MempoolExplorerClient) => Promise<T>): Promise<T> {
+        let lastError: unknown;
+        for (let attempt = 0; attempt < this.clients.length; attempt++) {
+            const client = this.clients[this.activeIndex];
+            try {
+                return await operation(client);
+            } catch (error) {
+                lastError = error;
+                if (!this.isTransient(error) || this.clients.length === 1) {
+                    throw error;
+                }
+                const from = client.baseUrl;
+                this.activeIndex = (this.activeIndex + 1) % this.clients.length;
+                this.onRotate?.(from, this.clients[this.activeIndex].baseUrl, error);
+            }
+        }
+        throw lastError;
+    }
+
+    // Failures worth failing over from: no response at all (timeout, DNS,
+    // refused, TLS), throttling (429), or upstream/CDN errors (5xx).
+    // 4xx responses are deterministic answers and must not rotate.
+    private isTransient(error: unknown): boolean {
+        if (!(error instanceof ExplorerRequestError)) return false;
+        if (error.status === undefined) return true;
+        return error.status === 429 || error.status >= 500;
+    }
+
+    getTransactionConfirmations(txid: string): Promise<number> {
+        return this.request(client => client.getTransactionConfirmations(txid));
+    }
+
+    getRawTransaction(txid: string): Promise<string> {
+        return this.request(client => client.getRawTransaction(txid));
+    }
+
+    getAddressUtxos(address: string): Promise<ExplorerUtxo[]> {
+        return this.request(client => client.getAddressUtxos(address));
+    }
+
+    broadcastTransaction(hex: string): Promise<string> {
+        return this.request(client => client.broadcastTransaction(hex));
+    }
+
+    getTipHeight(): Promise<number> {
+        return this.request(client => client.getTipHeight());
+    }
+
+    getOutspend(txid: string, vout: number): Promise<{ spent: boolean; confirmed: boolean } | null> {
+        return this.request(client => client.getOutspend(txid, vout));
+    }
+
+    getRecommendedFees(): Promise<RecommendedFees> {
+        return this.request(client => client.getRecommendedFees());
     }
 
     async assertHealthy(name: string): Promise<void> {

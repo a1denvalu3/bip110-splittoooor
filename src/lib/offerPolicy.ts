@@ -1,0 +1,1 @@
+export const MIN_OFFER_AMOUNT_SATS = 10_000;

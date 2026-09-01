@@ -10,6 +10,9 @@ const client = createClient({
     socket: { connectTimeout: 1000, reconnectStrategy: false }
 });
 const inFlight = new Map<string, Promise<unknown>>();
+type CacheEntry = { value: unknown; freshUntil: number; staleUntil: number };
+const memoryCache = new Map<string, CacheEntry>();
+const MAX_MEMORY_ENTRIES = 5_000;
 let connectPromise: Promise<boolean> | undefined;
 let loggedConnectionFailure = false;
 
@@ -48,27 +51,59 @@ export async function cachedExplorerRead<T>(
     operation: string,
     identity: unknown,
     ttlSeconds: number,
-    loader: () => Promise<T>
+    loader: () => Promise<T>,
+    staleIfError = false,
+    onStaleFallback?: (error: unknown) => void
 ): Promise<T> {
     const key = explorerCacheKey(operation, identity);
+    const now = Date.now();
+    const local = memoryCache.get(key);
+    if (local && local.freshUntil > now) return local.value as T;
+
     const existing = inFlight.get(key) as Promise<T> | undefined;
     if (existing) return existing;
 
     const request = (async () => {
         const connected = await ensureConnected();
+        let stale = local && local.staleUntil > now ? local : undefined;
         if (connected) {
             try {
                 const cached = await client.get(key);
-                if (cached !== null) return JSON.parse(cached) as T;
+                if (cached !== null) {
+                    const parsed = JSON.parse(cached) as CacheEntry;
+                    if (parsed && typeof parsed === 'object' && 'freshUntil' in parsed && 'value' in parsed) {
+                        remember(key, parsed);
+                        if (parsed.freshUntil > Date.now()) return parsed.value as T;
+                        if (parsed.staleUntil > Date.now()) stale = parsed;
+                    }
+                }
             } catch (error: any) {
                 logWarn('cache.read_failed', { operation, error: error.message });
             }
         }
 
-        const value = await loader();
+        let value: T;
+        try {
+            value = await loader();
+        } catch (error) {
+            if (staleIfError && stale) {
+                logWarn('cache.stale_fallback', { operation, error: error instanceof Error ? error.message : String(error) });
+                onStaleFallback?.(error);
+                return stale.value as T;
+            }
+            throw error;
+        }
+        const writtenAt = Date.now();
+        const staleSeconds = Math.max(ttlSeconds * 10, 300);
+        const entry: CacheEntry = {
+            value,
+            freshUntil: writtenAt + ttlSeconds * 1000,
+            staleUntil: writtenAt + (ttlSeconds + staleSeconds) * 1000
+        };
+        remember(key, entry);
         if (connected) {
             try {
-                await client.setEx(key, ttlSeconds, JSON.stringify(value));
+                await client.setEx(key, ttlSeconds + staleSeconds, JSON.stringify(entry));
             } catch (error: any) {
                 logWarn('cache.write_failed', { operation, error: error.message });
             }
@@ -81,6 +116,15 @@ export async function cachedExplorerRead<T>(
         return await request;
     } finally {
         inFlight.delete(key);
+    }
+}
+
+function remember(key: string, entry: CacheEntry): void {
+    memoryCache.delete(key);
+    memoryCache.set(key, entry);
+    if (memoryCache.size > MAX_MEMORY_ENTRIES) {
+        const oldest = memoryCache.keys().next().value as string | undefined;
+        if (oldest) memoryCache.delete(oldest);
     }
 }
 

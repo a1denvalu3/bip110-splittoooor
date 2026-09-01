@@ -1,21 +1,21 @@
-export const BIP110_MAX_ACTIVATION_HEIGHT = 965_664;
+// First block using the BLAKE2b proof-of-work rules on the fork chain.
+export const BLAKE2B_ACTIVATION_HEIGHT = 961_640;
 
 export type Bip110Activation = {
     ready: boolean;
     status: string;
     activationHeight: number | null;
     requiredHeight: number | null;
-    source: 'rpc' | 'height-fallback' | 'unavailable';
+    source: 'rpc' | 'height' | 'unavailable';
 };
 
 export function activationFromBlockchainInfo(info: any): Bip110Activation {
-    const deployment = info?.softforks?.reduced_data;
-    const bip9 = deployment?.bip9;
-    const status = String(bip9?.status ?? (deployment?.active ? 'active' : 'unknown')).toLowerCase();
-    const activationHeight = Number.isSafeInteger(bip9?.since) ? bip9.since : null;
+    const deployment = info?.blake2b ?? info?.deployments?.blake2b;
+    const status = String(deployment?.active ? 'active' : 'inactive').toLowerCase();
+    const activationHeight = Number.isSafeInteger(deployment?.height) ? deployment.height : null;
 
     return {
-        ready: status === 'active' || deployment?.active === true,
+        ready: deployment?.active === true,
         status,
         activationHeight,
         requiredHeight: activationHeight,
@@ -23,14 +23,14 @@ export function activationFromBlockchainInfo(info: any): Bip110Activation {
     };
 }
 
-export function mainnetHeightFallback(height: number): Bip110Activation {
+export function mainnetActivationFromHeight(height: number): Bip110Activation {
     const validHeight = Number.isSafeInteger(height) && height >= 0;
     return {
-        ready: validHeight && height >= BIP110_MAX_ACTIVATION_HEIGHT,
-        status: validHeight && height >= BIP110_MAX_ACTIVATION_HEIGHT ? 'active' : 'awaiting-activation-height',
-        activationHeight: BIP110_MAX_ACTIVATION_HEIGHT,
-        requiredHeight: BIP110_MAX_ACTIVATION_HEIGHT,
-        source: 'height-fallback'
+        ready: validHeight && height >= BLAKE2B_ACTIVATION_HEIGHT,
+        status: validHeight && height >= BLAKE2B_ACTIVATION_HEIGHT ? 'active' : 'awaiting-activation-height',
+        activationHeight: BLAKE2B_ACTIVATION_HEIGHT,
+        requiredHeight: BLAKE2B_ACTIVATION_HEIGHT,
+        source: 'height'
     };
 }
 

@@ -7,7 +7,8 @@ import { PureBitcoinSwap } from './lib/PureBitcoinSwap';
 import { buildOutpointSet, classifyOutpoint, outpointKey } from '../../../src/lib/utxoClassification';
 import { selectFundingUtxos } from '../../../src/lib/fundingSelection';
 import type { FundingFeeEstimator } from '../../../src/lib/fundingSelection';
-import { deadlineFromHeight, secondLockTimeOffset, validateLockTimeOffset } from '../../../src/lib/timelocks';
+import { deadlineFromHeight, secondLockTimeOffset, validateLockTimeOffset, MIN_CROSS_CHAIN_SAFETY_BLOCKS } from '../../../src/lib/timelocks';
+import { MIN_OFFER_AMOUNT_SATS } from '../../../src/lib/offerPolicy';
 import { 
   Wallet, 
   Coins, 
@@ -114,6 +115,19 @@ const API_BASE = (
   (import.meta.env.DEV ? 'http://localhost:4000/api' : '/api')
 ).replace(/\/$/, '');
 
+// Canonical JSON encoding shared with the backend: top-level keys sorted,
+// undefined values skipped. Must produce byte-identical output for signatures.
+const canonicalStringify = (obj: any): string => {
+  const keys = Object.keys(obj).sort();
+  const sortedObj: Record<string, any> = {};
+  for (const key of keys) {
+    if (obj[key] !== undefined) {
+      sortedObj[key] = obj[key];
+    }
+  }
+  return JSON.stringify(sortedObj);
+};
+
 interface UTXO {
   txid: string;
   vout: number;
@@ -131,6 +145,7 @@ interface Offer {
   acceptorPubKey?: string;
   acceptorBtcAmount: number;
   hashLock: string;
+  numsTweak?: string;
   lockTime: number;
   secondLockTime: number;
   lockTimeOffset: number;
@@ -180,7 +195,7 @@ const tutorialSteps = [
   {
     eyebrow: '03 / SPLIT THE DEPOSIT',
     title: 'Make each chain independently spendable.',
-    description: 'After the deposit confirms, open “2. Bilateral Splitter.” Select a confirmed unsplit UTXO and press “Split Coins.” Wait for confirmation before using the resulting BTC or BIP110 balance.',
+    description: 'After the shared deposit confirms, activate the BLAKE2b fork, then open “2. Bilateral Splitter.” The unified signature moves only the fork-side coin and leaves the Bitcoin outpoint untouched.',
     note: 'Bilateral Splitter → select UTXO → Split Coins',
     icon: GitFork,
     tone: 'lime'
@@ -340,6 +355,9 @@ function TutorialCarousel({ open, onClose }: TutorialCarouselProps) {
 }
 
 export default function App() {
+  const POLL_BASE_MS = 30_000;
+  const WALLET_POLL_EVERY_TICKS = 2;
+  type RateLimitedResource = 'chain state' | 'marketplace' | 'wallet';
   // Navigation & Network Mode
   const [activeTab, setActiveTab] = useState<'wallet' | 'splitter' | 'marketplace' | 'my-offers' | 'wizard'>('wallet');
   const [isTutorialOpen, setIsTutorialOpen] = useState(
@@ -398,6 +416,12 @@ export default function App() {
   const balanceFetchInFlightRef = useRef<boolean>(false);
   const balanceRefreshQueuedRef = useRef<boolean>(false);
   const balanceRetryAfterRef = useRef<number>(0);
+  const nodeFetchInFlightRef = useRef<boolean>(false);
+  const offersFetchInFlightRef = useRef<boolean>(false);
+  const nodeRetryAfterRef = useRef<number>(0);
+  const offersRetryAfterRef = useRef<number>(0);
+  const [rateLimitNotices, setRateLimitNotices] = useState<Partial<Record<RateLimitedResource, number>>>({});
+  const [rateLimitClock, setRateLimitClock] = useState<number>(() => Date.now());
 
   // Selected UTXO to split
   const [nodeInfo, setNodeInfo] = useState<{
@@ -408,7 +432,7 @@ export default function App() {
       status: string;
       activationHeight: number | null;
       requiredHeight: number | null;
-      source: 'rpc' | 'height-fallback' | 'unavailable';
+      source: 'rpc' | 'height' | 'unavailable';
     };
     errors?: { main?: string; bip110?: string };
   }>({
@@ -419,9 +443,9 @@ export default function App() {
   const [selectedUtxoToSplit, setSelectedUtxoToSplit] = useState<UTXO | null>(null);
   const [splittingBilateral, setSplittingBilateral] = useState<boolean>(false);
   const [bilateralSplitResult, setBilateralSplitResult] = useState<{
-    mainSuccess?: boolean;
-    mainTxid?: string;
-    mainError?: string;
+    bip110Success?: boolean;
+    bip110Txid?: string;
+    bip110Error?: string;
   } | null>(null);
 
   // Faucet & Block Mining (Regtest only)
@@ -461,6 +485,11 @@ export default function App() {
   const [withdrawAmountSats, setWithdrawAmountSats] = useState<string>('');
   const [withdrawing, setWithdrawing] = useState<boolean>(false);
 
+  // BIP110 raw transaction relay state
+  const [relayTransactionHex, setRelayTransactionHex] = useState<string>('');
+  const [relaySubmitting, setRelaySubmitting] = useState<boolean>(false);
+  const [relayResult, setRelayResult] = useState<{ txid: string } | null>(null);
+
   // Toast notifications
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
 
@@ -469,9 +498,30 @@ export default function App() {
     return networkMode === 'mainnet' ? bitcoin.networks.bitcoin : bitcoin.networks.regtest;
   };
 
+  // Query a fresh block height straight from the node proxy (bypasses polled state).
   const getFreshChainHeight = async (chain: 'main' | 'bip110'): Promise<number> => {
     const response = await axios.get(`${API_BASE}/node/info`);
-    return chain === 'main' ? response.data.mainHeight : response.data.bip110Height;
+    const height = chain === 'main' ? response.data.mainHeight : response.data.bip110Height;
+    if (!Number.isFinite(height) || height <= 0) {
+      throw new Error(`Cannot determine the current ${chain === 'main' ? 'Bitcoin' : 'BIP110'} block height.`);
+    }
+    return height;
+  };
+
+  // The NUMS tweak committed in the offer record derives the HTLC internal key
+  // (K = H + u*G), making the key path unspendable. Old offers lack it.
+  const getOfferNumsTweak = (offer: Offer): Buffer => {
+    if (!offer.numsTweak) {
+      throw new Error('Offer predates the NUMS construction and cannot be used');
+    }
+    return Buffer.from(offer.numsTweak, 'hex');
+  };
+
+  // F18: show the exact fee and change before broadcasting any fee-paying transaction.
+  const confirmFeeDetails = (feeSats: number | bigint, changeSats: number | bigint): boolean => {
+    return window.confirm(
+      `Transaction fee review:\n\nNetwork fee: ${feeSats} sats\nChange returned to you: ${changeSats} sats\n\nProceed with broadcast?`
+    );
   };
 
   const getSecondHtlcLockTime = (offer: Offer, network: bitcoin.Network): number => {
@@ -481,7 +531,7 @@ export default function App() {
 
     const commonArgs = [
       secondHtlcAddress,
-      Buffer.from(offer.initiatorPubKey, 'hex'),
+      getOfferNumsTweak(offer),
       Buffer.from(offer.hashLock, 'hex'),
       Buffer.from(offer.initiatorPubKey, 'hex'),
       Buffer.from(offer.acceptorPubKey, 'hex')
@@ -580,7 +630,7 @@ export default function App() {
     if (!address || !txid || vout === undefined || !deadline) throw new Error('The committed HTLC funding data is incomplete.');
 
     const validContract = PureBitcoinSwap.verifyTaprootHtlcAddress(
-      address, Buffer.from(offer.initiatorPubKey, 'hex'), Buffer.from(offer.hashLock, 'hex'),
+      address, getOfferNumsTweak(offer), Buffer.from(offer.hashLock, 'hex'),
       recipient, refund, deadline, getNetwork()
     );
     if (!validContract) throw new Error('The committed HTLC address does not match the independently reconstructed contract.');
@@ -780,7 +830,7 @@ export default function App() {
         const keyPair = getKeyPairForPubKey(Buffer.from(refundPubKey).toString('hex'), net);
 
         const htlcPayment = PureBitcoinSwap.createTaprootHtlc(
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           recipientPubKey,
           refundPubKey,
@@ -800,10 +850,12 @@ export default function App() {
           Buffer.from(selectedOffer.hashLock, 'hex'),
           recipientPubKey,
           htlcPayment,
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           selectedOffer.lockTime,
           net
         );
+
+        if (!confirmFeeDetails(refundFeeSats, 0)) throw new Error('Refund broadcast cancelled by user.');
 
         // Broadcast raw tx
         const settlementRes = await axios.post(`${API_BASE}/tx/broadcast`, {
@@ -847,7 +899,7 @@ export default function App() {
         const keyPair = getKeyPairForPubKey(Buffer.from(secondHtlcRefund).toString('hex'), net);
 
         const htlcPayment = PureBitcoinSwap.createTaprootHtlc(
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           secondHtlcRecipient,
           secondHtlcRefund,
@@ -867,10 +919,12 @@ export default function App() {
           Buffer.from(selectedOffer.hashLock, 'hex'),
           secondHtlcRecipient,
           htlcPayment,
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           requiredLockTime,
           net
         );
+
+        if (!confirmFeeDetails(refundFeeSats, 0)) throw new Error('Refund broadcast cancelled by user.');
 
         // Broadcast raw tx
         const settlementRes = await axios.post(`${API_BASE}/tx/broadcast`, {
@@ -930,7 +984,8 @@ export default function App() {
     };
   };
 
-  // Find derived keypair in history by public key hex, or return the active keypair as fallback
+  // Find derived keypair in history by public key hex; never silently falls back
+  // to the active keypair, which would sign with the wrong key.
   const getKeyPairForPubKey = (pubKeyHex: string, network: bitcoin.Network): any => {
     for (let i = 0; i <= maxIndex; i++) {
       const kp = deriveKeyPairForIndex(masterPrivateKey, i, network);
@@ -938,8 +993,7 @@ export default function App() {
         return kp;
       }
     }
-    // Fallback to active private key
-    return ECPair.fromPrivateKey(Buffer.from(privateKey, 'hex'), { network });
+    throw new Error('Offer pubkey is not derived from the active wallet');
   };
 
   const getRecommendedFeeRate = async (chain: 'main' | 'bip110'): Promise<number> => {
@@ -947,7 +1001,7 @@ export default function App() {
 
     const res = await axios.get(`${API_BASE}/fees/recommended?chain=${chain}`, { timeout: 5000 });
     const rate = Number(res.data.halfHourFee || res.data.hourFee);
-    if (!Number.isFinite(rate) || rate <= 0) {
+    if (!Number.isFinite(rate) || rate <= 0 || rate > 500) {
       throw new Error(`Explorer returned an invalid fee rate for ${chain}`);
     }
     return rate;
@@ -980,7 +1034,7 @@ export default function App() {
 
   // Dynamically calculate transaction fee in Satoshis depending on active network mode
   const calculateTxFee = async (
-    txType: 'split-script' | 'split-keypath' | 'funding' | 'claim' | 'refund' | 'withdraw',
+    txType: 'split-unified' | 'funding' | 'claim' | 'refund' | 'withdraw',
     hasChange: boolean = false,
     chain: 'main' | 'bip110' = 'main'
   ): Promise<number> => {
@@ -990,7 +1044,7 @@ export default function App() {
       if (txType === 'claim') return 2000;
       if (txType === 'refund') return 2000;
       if (txType === 'withdraw') return 5000;
-      return 2000; // split-script / split-keypath
+      return 2000; // unified key-path split
     }
 
     // Mainnet Mode: Fetch feerate from the chain-specific backend proxy.
@@ -1000,11 +1054,8 @@ export default function App() {
 
     let vBytes = 150;
     switch (txType) {
-      case 'split-script':
-        vBytes = 130;
-        break;
-      case 'split-keypath':
-        vBytes = 115;
+      case 'split-unified':
+        vBytes = 112;
         break;
       case 'funding':
         vBytes = hasChange ? 160 : 115;
@@ -1232,16 +1283,21 @@ export default function App() {
     setHasBalanceSnapshot(false);
     setBalanceSyncStatus('loading');
     balanceRetryAfterRef.current = 0;
+    nodeRetryAfterRef.current = 0;
+    offersRetryAfterRef.current = 0;
+    setRateLimitNotices({});
     const keyPrefix = networkMode === 'mainnet' ? 'mainnet' : 'regtest';
     const net = getNetwork();
 
-    let masterPriv = sessionStorage.getItem(`${keyPrefix}_master_privkey`);
+    let masterPriv = localStorage.getItem(`${keyPrefix}_master_privkey`);
     let activeIdx = parseInt(localStorage.getItem(`${keyPrefix}_active_index`) || '0', 10);
     let maxIdx = parseInt(localStorage.getItem(`${keyPrefix}_max_index`) || '0', 10);
 
     if (!masterPriv) {
-      // Migrate pre-existing non-master private key to master if exists, or generate a fresh one
-      const oldPriv = localStorage.getItem(`${keyPrefix}_master_privkey`) || localStorage.getItem(`${keyPrefix}_bip110_privkey`);
+      // Migrate legacy session-scoped or pre-master keys if present, or generate a fresh one
+      const oldPriv = sessionStorage.getItem(`${keyPrefix}_master_privkey`)
+        || sessionStorage.getItem(`${keyPrefix}_bip110_privkey`)
+        || localStorage.getItem(`${keyPrefix}_bip110_privkey`);
       if (oldPriv) {
         masterPriv = oldPriv;
       } else {
@@ -1250,13 +1306,13 @@ export default function App() {
       }
       activeIdx = 0;
       maxIdx = 0;
-      sessionStorage.setItem(`${keyPrefix}_master_privkey`, masterPriv);
+      localStorage.setItem(`${keyPrefix}_master_privkey`, masterPriv);
       localStorage.setItem(`${keyPrefix}_active_index`, '0');
       localStorage.setItem(`${keyPrefix}_max_index`, '0');
     }
-    // Remove legacy persistent plaintext secrets after one-time migration.
-    localStorage.removeItem(`${keyPrefix}_master_privkey`);
-    localStorage.removeItem(`${keyPrefix}_bip110_privkey`);
+    // Remove legacy session-scoped plaintext secrets after one-time migration.
+    sessionStorage.removeItem(`${keyPrefix}_master_privkey`);
+    sessionStorage.removeItem(`${keyPrefix}_bip110_privkey`);
 
     setMasterPrivateKey(masterPriv);
     setActiveIndex(activeIdx);
@@ -1276,30 +1332,51 @@ export default function App() {
     fetchNodeInfo();
   }, [networkMode]);
 
-  // Fetch offers immediately whenever pagination/sorting or networkMode changes
-  useEffect(() => {
-    fetchOffers();
-  }, [networkMode, offersPage, offersLimit, offersOrderBy, offersOrderDir]);
+  const needsWalletData = activeTab === 'wallet'
+    || activeTab === 'splitter'
+    || activeTab === 'marketplace'
+    || activeTab === 'wizard';
+  const needsOfferData = activeTab === 'marketplace'
+    || activeTab === 'my-offers'
+    || activeTab === 'wizard';
 
-  // Sync balances and UTXOs when splitAddress, ownAddress or activeTab/networkMode changes
+  // Fetch offers only while the current workflow displays or acts on them.
   useEffect(() => {
-    if (splitAddress && ownAddress) {
+    if (needsOfferData) fetchOffers();
+  }, [needsOfferData, networkMode, offersPage, offersLimit, offersOrderBy, offersOrderDir]);
+
+  // Refresh the wallet when its identity or scan range changes. Tab changes do not
+  // alter wallet data and must not fan out another full multi-address scan.
+  useEffect(() => {
+    if (needsWalletData && splitAddress && ownAddress) {
       fetchBalances();
     }
-  }, [splitAddress, ownAddress, activeTab, networkMode, masterPrivateKey, maxIndex]);
+  }, [needsWalletData, splitAddress, ownAddress, networkMode, masterPrivateKey, maxIndex]);
 
-  // Poll node info, marketplace offers, and wallet balances/UTXOs every 10 seconds for active, real-time updates
+  // One coordinator owns all background polling. Lightweight state refreshes every
+  // 30s; the expensive multi-address, cross-chain wallet scan refreshes every 60s.
+  // Hidden tabs issue no polling traffic.
   useEffect(() => {
+    let tick = 0;
     const interval = setInterval(() => {
-      fetchNodeInfo();
-      fetchOffers();
-      if (splitAddress && ownAddress) {
+      if (document.visibilityState !== 'visible') return;
+      tick += 1;
+      if (tick % 2 === 0) fetchNodeInfo();
+      if (needsOfferData) fetchOffers();
+      if (needsWalletData && tick % WALLET_POLL_EVERY_TICKS === 0 && splitAddress && ownAddress) {
         fetchBalances();
       }
-    }, 10000);
+    }, POLL_BASE_MS);
 
     return () => clearInterval(interval);
-  }, [networkMode, splitAddress, ownAddress, masterPrivateKey, maxIndex, offersPage, offersLimit, offersOrderBy, offersOrderDir]);
+  }, [needsOfferData, needsWalletData, networkMode, splitAddress, ownAddress, masterPrivateKey, maxIndex, offersPage, offersLimit, offersOrderBy, offersOrderDir]);
+
+  useEffect(() => {
+    const retryTimes = Object.values(rateLimitNotices).filter((value): value is number => typeof value === 'number');
+    if (retryTimes.length === 0) return;
+    const interval = window.setInterval(() => setRateLimitClock(Date.now()), 1_000);
+    return () => window.clearInterval(interval);
+  }, [rateLimitNotices]);
 
   // Keep selectedOffer in sync with the polled offersList to transition wizard steps in real-time
   useEffect(() => {
@@ -1314,6 +1391,49 @@ export default function App() {
   const showToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
     setToast({ message, type });
     setTimeout(() => setToast(null), 5000);
+  };
+
+  const relayPreview = React.useMemo(() => {
+    const hex = relayTransactionHex.trim();
+    if (!hex) return null;
+    if (!/^[0-9a-fA-F]+$/.test(hex) || hex.length % 2 !== 0) {
+      return { error: 'Enter an even number of hexadecimal characters.' } as const;
+    }
+    try {
+      const tx = bitcoin.Transaction.fromHex(hex);
+      return {
+        txid: tx.getId(),
+        bytes: tx.byteLength(),
+        virtualSize: tx.virtualSize(),
+        inputs: tx.ins.length,
+        outputs: tx.outs.length
+      } as const;
+    } catch {
+      return { error: 'This is not a decodable raw Bitcoin transaction.' } as const;
+    }
+  }, [relayTransactionHex]);
+
+  const submitBip110Transaction = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!relayPreview || 'error' in relayPreview) {
+      showToast('Paste a valid signed raw transaction first.', 'error');
+      return;
+    }
+
+    setRelaySubmitting(true);
+    setRelayResult(null);
+    try {
+      const response = await axios.post(`${API_BASE}/tx/bip110/submit`, {
+        hex: relayTransactionHex.trim()
+      });
+      setRelayResult({ txid: response.data.txid });
+      showToast('Transaction accepted by the BIP110 relay.', 'success');
+    } catch (err: any) {
+      const message = err.response?.data?.error || err.message;
+      showToast(`BIP110 relay rejected the transaction: ${message}`, 'error');
+    } finally {
+      setRelaySubmitting(false);
+    }
   };
 
   const handleDownloadRecoveryFile = async () => {
@@ -1382,8 +1502,22 @@ export default function App() {
           return;
         }
 
+        // F10: the master key must be a 32-byte hex string AND a valid secp256k1 private key.
+        if (!/^[0-9a-fA-F]{64}$/.test(data.masterPrivateKey) || !ecc.isPrivate(Buffer.from(data.masterPrivateKey, 'hex'))) {
+          showToast('Invalid recovery file: the master private key is not a valid secp256k1 private key.', 'error');
+          return;
+        }
+
+        if (data.networkMode && data.networkMode !== networkMode) {
+          showToast(`Recovery file is for ${data.networkMode} mode, but the app is in ${networkMode} mode. Switch networks first.`, 'error');
+          return;
+        }
+
+        // Show the first derived address of the wallet being restored so the
+        // user can eyeball it before overwriting the active wallet.
+        const restoredFirstKeys = deriveKeysForIndex(data.masterPrivateKey, 0, getNetwork());
         const confirmed = window.confirm(
-          `Are you sure you want to restore this wallet?\n\nThis will overwrite your current Master Private Key (${masterPrivateKey.substring(0, 10)}...) and derived addresses with the ones from the backup.\n\nMake sure you have backed up any current keys first!`
+          `Are you sure you want to restore this wallet?\n\nThis will overwrite your current Master Private Key (${masterPrivateKey.substring(0, 10)}...) and derived addresses with the ones from the backup.\n\nFirst derived address (index 0) of the restored wallet:\n${restoredFirstKeys.ownAddress}\n\nMake sure you have backed up any current keys first!`
         );
         if (!confirmed) return;
 
@@ -1402,7 +1536,7 @@ export default function App() {
         setActiveIndex(activeIdx);
         setMaxIndex(maxIdx);
 
-        sessionStorage.setItem(`${keyPrefix}_master_privkey`, masterPriv);
+        localStorage.setItem(`${keyPrefix}_master_privkey`, masterPriv);
         localStorage.setItem(`${keyPrefix}_active_index`, String(activeIdx));
         localStorage.setItem(`${keyPrefix}_max_index`, String(maxIdx));
 
@@ -1448,7 +1582,7 @@ export default function App() {
       localStorage.setItem(`${keyPrefix}_active_index`, String(newMaxIndex));
       localStorage.setItem(`${keyPrefix}_max_index`, String(newMaxIndex));
 
-      sessionStorage.setItem(`${keyPrefix}_bip110_privkey`, activeKeys.privateKey);
+      localStorage.setItem(`${keyPrefix}_bip110_privkey`, activeKeys.privateKey);
       localStorage.setItem(`${keyPrefix}_bip110_pubkey`, activeKeys.publicKey);
       localStorage.setItem(`${keyPrefix}_bip110_address`, activeKeys.splitAddress);
       
@@ -1476,14 +1610,43 @@ export default function App() {
 
     localStorage.setItem(`${keyPrefix}_active_index`, String(index));
 
-    sessionStorage.setItem(`${keyPrefix}_bip110_privkey`, activeKeys.privateKey);
+    localStorage.setItem(`${keyPrefix}_bip110_privkey`, activeKeys.privateKey);
     localStorage.setItem(`${keyPrefix}_bip110_pubkey`, activeKeys.publicKey);
     localStorage.setItem(`${keyPrefix}_bip110_address`, activeKeys.splitAddress);
 
     showToast(`Switched active P2TR address to Address #${index + 1}`, 'success');
   };
 
+  const clearRateLimit = (resource: RateLimitedResource) => {
+    setRateLimitNotices(current => {
+      if (!(resource in current)) return current;
+      const next = { ...current };
+      delete next[resource];
+      return next;
+    });
+  };
+
+  const recordRateLimit = (err: any, resource: RateLimitedResource, fallbackSeconds = 60): number | undefined => {
+    const detail = String(err.response?.data?.detail || '');
+    const isRateLimited = err.response?.status === 429 || detail.includes('HTTP 429');
+    if (!isRateLimited) return undefined;
+
+    const header = err.response?.headers?.['retry-after'];
+    const numericSeconds = Number(header);
+    const parsedDate = typeof header === 'string' ? Date.parse(header) : Number.NaN;
+    const retryAt = Number.isFinite(numericSeconds) && numericSeconds > 0
+      ? Date.now() + numericSeconds * 1_000
+      : Number.isFinite(parsedDate) && parsedDate > Date.now()
+        ? parsedDate
+        : Date.now() + fallbackSeconds * 1_000;
+    setRateLimitNotices(current => ({ ...current, [resource]: retryAt }));
+    setRateLimitClock(Date.now());
+    return retryAt;
+  };
+
   const fetchNodeInfo = async () => {
+    if (nodeFetchInFlightRef.current || Date.now() < nodeRetryAfterRef.current) return;
+    nodeFetchInFlightRef.current = true;
     try {
       const res = await axios.get(`${API_BASE}/node/info`);
       setNodeInfo({
@@ -1492,45 +1655,68 @@ export default function App() {
         bip110Activation: res.data.bip110Activation ?? { ready: false, status: 'unavailable', activationHeight: null, requiredHeight: null, source: 'unavailable' },
         errors: res.data.errors
       });
+      nodeRetryAfterRef.current = 0;
+      clearRateLimit('chain state');
     } catch (err: any) {
-      setNodeInfo({
-        mainHeight: 0,
-        bip110Height: 0,
-        bip110Activation: { ready: false, status: 'unavailable', activationHeight: null, requiredHeight: null, source: 'unavailable' }
-      });
+      const retryAt = recordRateLimit(err, 'chain state');
+      if (retryAt) {
+        nodeRetryAfterRef.current = retryAt;
+      } else {
+        setNodeInfo({
+          mainHeight: 0,
+          bip110Height: 0,
+          bip110Activation: { ready: false, status: 'unavailable', activationHeight: null, requiredHeight: null, source: 'unavailable' }
+        });
+      }
       console.error(err);
+    } finally {
+      nodeFetchInFlightRef.current = false;
     }
   };
 
   const fetchOffers = async () => {
+    if (offersFetchInFlightRef.current || Date.now() < offersRetryAfterRef.current) return;
+    offersFetchInFlightRef.current = true;
     try {
-      // 1. Fetch Marketplace Offers (others' offers)
-      const excludeParam = publicKey ? `&excludePubKey=${publicKey}` : '';
-      const marketplaceRes = await axios.get(
-        `${API_BASE}/offers?networkMode=${networkMode}${excludeParam}&page=${offersPage}&limit=${offersLimit}&orderBy=${offersOrderBy}&orderDir=${offersOrderDir}`
-      );
-      setMarketplaceOffers(marketplaceRes.data.offers);
-      setOffersTotal(marketplaceRes.data.total);
-      setOffersTotalPages(marketplaceRes.data.totalPages);
+      const wantsMarketplace = activeTab === 'marketplace' || activeTab === 'wizard';
+      const wantsPersonalOffers = activeTab === 'my-offers' || activeTab === 'wizard';
+      const requests: Promise<void>[] = [];
 
-      if (publicKey) {
-        // 2. Fetch My Created Offers
-        const createdRes = await axios.get(
-          `${API_BASE}/offers?networkMode=${networkMode}&initiatorPubKey=${publicKey}&limit=100`
-        );
-        setMyCreatedOffers(createdRes.data.offers);
+      if (wantsMarketplace) {
+        requests.push((async () => {
+          const excludeParam = publicKey ? `&excludePubKey=${publicKey}` : '';
+          const response = await axios.get(
+            `${API_BASE}/offers?networkMode=${networkMode}${excludeParam}&page=${offersPage}&limit=${offersLimit}&orderBy=${offersOrderBy}&orderDir=${offersOrderDir}`
+          );
+          setMarketplaceOffers(response.data.offers);
+          setOffersTotal(response.data.total);
+          setOffersTotalPages(response.data.totalPages);
+        })());
+      }
 
-        // 3. Fetch My Accepted Offers
-        const acceptedRes = await axios.get(
-          `${API_BASE}/offers?networkMode=${networkMode}&acceptorPubKey=${publicKey}&limit=100`
-        );
-        setMyAcceptedOffers(acceptedRes.data.offers);
-      } else {
+      if (wantsPersonalOffers && publicKey) {
+        requests.push((async () => {
+          const [createdRes, acceptedRes] = await Promise.all([
+            axios.get(`${API_BASE}/offers?networkMode=${networkMode}&initiatorPubKey=${publicKey}&limit=100`),
+            axios.get(`${API_BASE}/offers?networkMode=${networkMode}&acceptorPubKey=${publicKey}&limit=100`)
+          ]);
+          setMyCreatedOffers(createdRes.data.offers);
+          setMyAcceptedOffers(acceptedRes.data.offers);
+        })());
+      } else if (wantsPersonalOffers) {
         setMyCreatedOffers([]);
         setMyAcceptedOffers([]);
       }
+
+      await Promise.all(requests);
+      offersRetryAfterRef.current = 0;
+      clearRateLimit('marketplace');
     } catch (err: any) {
+      const retryAt = recordRateLimit(err, 'marketplace');
+      if (retryAt) offersRetryAfterRef.current = retryAt;
       console.error(err);
+    } finally {
+      offersFetchInFlightRef.current = false;
     }
   };
 
@@ -1553,6 +1739,7 @@ export default function App() {
       let aggregatedBip110Utxos: any[] = [];
       let aggregatedOwnMainUtxos: any[] = [];
       let aggregatedOwnBip110Utxos: any[] = [];
+      let usedRateLimitedFallback = false;
 
       // Async transaction handlers may call this function from a render that predates
       // a freshly derived change address. The persisted index is updated synchronously,
@@ -1569,19 +1756,23 @@ export default function App() {
         
         // 1. Fetch Contract UTXOs (Unsplit)
         const resMain = await axios.post(`${API_BASE}/wallet/utxos`, { address: childKeys.splitAddress, chain: 'main', networkMode });
+        usedRateLimitedFallback ||= resMain.data.rateLimited === true;
         const mainWithIndex = resMain.data.utxos.map((u: any) => ({ ...u, index: i, address: childKeys.splitAddress }));
         aggregatedMainUtxos.push(...mainWithIndex);
 
         const resBip110 = await axios.post(`${API_BASE}/wallet/utxos`, { address: childKeys.splitAddress, chain: 'bip110', networkMode });
+        usedRateLimitedFallback ||= resBip110.data.rateLimited === true;
         const bip110WithIndex = resBip110.data.utxos.map((u: any) => ({ ...u, index: i, address: childKeys.splitAddress }));
         aggregatedBip110Utxos.push(...bip110WithIndex);
 
         // 2. Fetch derived keypath-address UTXOs; cross-chain presence determines classification.
         const resOwnMain = await axios.post(`${API_BASE}/wallet/utxos`, { address: childKeys.ownAddress, chain: 'main', networkMode });
+        usedRateLimitedFallback ||= resOwnMain.data.rateLimited === true;
         const ownMainWithIndex = resOwnMain.data.utxos.map((u: any) => ({ ...u, index: i, address: childKeys.ownAddress }));
         aggregatedOwnMainUtxos.push(...ownMainWithIndex);
 
         const resOwnBip110 = await axios.post(`${API_BASE}/wallet/utxos`, { address: childKeys.ownAddress, chain: 'bip110', networkMode });
+        usedRateLimitedFallback ||= resOwnBip110.data.rateLimited === true;
         const ownBip110WithIndex = resOwnBip110.data.utxos.map((u: any) => ({ ...u, index: i, address: childKeys.ownAddress }));
         aggregatedOwnBip110Utxos.push(...ownBip110WithIndex);
       }
@@ -1611,20 +1802,24 @@ export default function App() {
       const totalOwnBip110 = aggregatedOwnBip110Utxos.reduce((sum, u) => sum + u.amount, 0);
       setOwnBip110Balance(totalOwnBip110);
 
-      balanceRetryAfterRef.current = 0;
       setHasBalanceSnapshot(true);
-      setBalanceSyncStatus('ready');
+      if (usedRateLimitedFallback) {
+        balanceRetryAfterRef.current = recordRateLimit({ response: { status: 429 } }, 'wallet', 60) ?? Date.now() + 60_000;
+        setBalanceSyncStatus('rate-limited');
+      } else {
+        balanceRetryAfterRef.current = 0;
+        clearRateLimit('wallet');
+        setBalanceSyncStatus('ready');
+      }
 
-      fetchNodeInfo();
     } catch (err: any) {
       // Publish only complete cross-chain snapshots. A failed refresh must not turn
       // a known wallet into an alarming zero balance or empty UTXO set.
       if (err.response?.status === 429) {
-        const retryAfterHeader = Number(err.response?.headers?.['retry-after']);
-        const retryAfterSeconds = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
-          ? retryAfterHeader
-          : 10;
-        balanceRetryAfterRef.current = Date.now() + retryAfterSeconds * 1000;
+        balanceRetryAfterRef.current = recordRateLimit(err, 'wallet', 60) ?? Date.now() + 60_000;
+        setBalanceSyncStatus('rate-limited');
+      } else if (String(err.response?.data?.detail || '').includes('HTTP 429')) {
+        balanceRetryAfterRef.current = recordRateLimit(err, 'wallet', 60) ?? Date.now() + 60_000;
         setBalanceSyncStatus('rate-limited');
       } else {
         setBalanceSyncStatus('error');
@@ -1702,19 +1897,25 @@ export default function App() {
     const pubKey = Buffer.from(ownerKeyPair.publicKey);
     const splitPayment = PureBitcoinSwap.createSplitPayment(pubKey, net);
 
-    const feeSats = await calculateTxFee('split-script', false, 'main');
+    const feeSats = await calculateTxFee('split-unified', false, 'bip110');
     const inputSats = BigInt(selectedUtxoToSplit.amount);
     const fee = BigInt(feeSats);
     const outputSats = inputSats - fee;
 
-    let mainTxid = '';
-    let mainError = '';
-    let mainSuccess = false;
+    if (!confirmFeeDetails(feeSats, 0)) {
+      showToast('Split broadcast cancelled by user.', 'info');
+      setSplittingBilateral(false);
+      return;
+    }
 
-    // We ONLY perform the script-spend split spend on the Main-Chain (Bitcoin Core)
-    // The previous pre-fork UTXO will remain valid and unspent on BIP110-Chain because the split-spend is rejected.
+    let bip110Txid = '';
+    let bip110Error = '';
+    let bip110Success = false;
+
+    // Spend only on the BLAKE2b chain with SIGHASH_UNIFIED. Bitcoin rejects
+    // that signature hash and retains the original pre-fork output.
     try {
-      const txMain = PureBitcoinSwap.buildScriptpathSplitTx(
+      const txBip110 = PureBitcoinSwap.buildUnifiedSplitTx(
         ownerKeyPair,
         selectedUtxoToSplit.txid,
         selectedUtxoToSplit.vout,
@@ -1726,29 +1927,29 @@ export default function App() {
         net
       );
 
-      const resMain = await axios.post(`${API_BASE}/tx/broadcast`, {
-        hex: txMain.toHex(),
-        chain: 'main',
+      const resBip110 = await axios.post(`${API_BASE}/tx/broadcast`, {
+        hex: txBip110.toHex(),
+        chain: 'bip110',
         networkMode,
         isSplit: true
       });
 
-      mainTxid = resMain.data.txid;
-      mainSuccess = true;
+      bip110Txid = resBip110.data.txid;
+      bip110Success = true;
     } catch (err: any) {
-      mainError = err.message;
+      bip110Error = err.message;
     }
 
     setBilateralSplitResult({
-      mainSuccess,
-      mainTxid,
-      mainError
+      bip110Success,
+      bip110Txid,
+      bip110Error
     });
 
-    if (mainSuccess) {
-      showToast('Scriptpath split successfully broadcasted on Main-Chain! BIP110 previous UTXO is now marked as split.', 'success');
+    if (bip110Success) {
+      showToast('Unified split broadcast on the BLAKE2b chain. The original output remains on Bitcoin.', 'success');
     } else {
-      showToast('Bilateral split failed: ' + mainError, 'error');
+      showToast('Bilateral split failed: ' + bip110Error, 'error');
     }
 
     setSelectedUtxoToSplit(null);
@@ -1804,6 +2005,9 @@ export default function App() {
       const finalHasChange = inputSats > BigInt(withdrawSats) + BigInt(initialFeeSats);
       const finalFeeSats = await calculateTxFee('withdraw', finalHasChange, targetChain);
       const changeAddress = finalHasChange ? getNewChangeAddress(net) : undefined;
+
+      const changeSats = finalHasChange ? inputSats - BigInt(withdrawSats) - BigInt(finalFeeSats) : 0n;
+      if (!confirmFeeDetails(finalFeeSats, changeSats)) throw new Error('Withdrawal broadcast cancelled by user.');
 
       showToast(`Signing withdrawal from Address #${utxoIndex + 1}...`, "info");
 
@@ -1903,17 +2107,6 @@ export default function App() {
   };
 
   const secureUpdateOffer = async (offerId: string, fields: Partial<Offer>, signerRole: 'initiator' | 'acceptor') => {
-    const canonicalStringify = (obj: any): string => {
-      const keys = Object.keys(obj).sort();
-      const sortedObj: Record<string, any> = {};
-      for (const key of keys) {
-        if (obj[key] !== undefined) {
-          sortedObj[key] = obj[key];
-        }
-      }
-      return JSON.stringify(sortedObj);
-    };
-
     const msg = `update-offer:${offerId}:${canonicalStringify(fields)}`;
     const msgHash = bitcoin.crypto.sha256(Buffer.from(msg));
     
@@ -1940,8 +2133,12 @@ export default function App() {
       const backingChain = selectedBackingChain;
 
       const sellAmount = Number(sellAmountSats);
-      if (!Number.isSafeInteger(sellAmount) || sellAmount <= 0) {
-        throw new Error("Please enter a valid whole-number sell amount in sats.");
+      if (!Number.isSafeInteger(sellAmount) || sellAmount < MIN_OFFER_AMOUNT_SATS) {
+        throw new Error(`Sell amount must be at least ${MIN_OFFER_AMOUNT_SATS.toLocaleString()} sats.`);
+      }
+      const buyAmount = backingChain === 'main' ? Number(newOfferB110) : Number(newOfferBtc);
+      if (!Number.isSafeInteger(buyAmount) || buyAmount < MIN_OFFER_AMOUNT_SATS) {
+        throw new Error(`The amount requested in return must be at least ${MIN_OFFER_AMOUNT_SATS.toLocaleString()} sats.`);
       }
 
       const fundingCandidates = getSplitUtxosForChain(backingChain!);
@@ -1990,20 +2187,33 @@ export default function App() {
 
       const lockTimeOffset = validateLockTimeOffset(newOfferLocktime);
 
-      const res = await axios.post(`${API_BASE}/offers`, {
+      // F1: fresh NUMS tweak — the HTLC internal key becomes H + u*G, unspendable via key path.
+      const numsTweak = PureBitcoinSwap.generateNumsTweak().toString('hex');
+
+      // F2: prove ownership of the initiator key by signing the canonical offer fields.
+      const offerFields = {
         initiatorPubKey: publicKey,
         initiatorB110Amount: Number(newOfferB110),
         acceptorBtcAmount: Number(newOfferBtc),
         hashLock: hashLockHex,
         lockTimeOffset,
-        networkMode,
         backingTxid,
         backingVout,
-        backingChain
+        backingChain,
+        numsTweak
+      };
+      const createMessage = `create-offer:${canonicalStringify(offerFields)}`;
+      const createPair = ECPair.fromPrivateKey(Buffer.from(privateKey, 'hex'));
+      const signature = Buffer.from(createPair.sign(bitcoin.crypto.sha256(Buffer.from(createMessage)))).toString('hex');
+
+      const res = await axios.post(`${API_BASE}/offers`, {
+        ...offerFields,
+        networkMode,
+        signature
       });
 
       // Save preimage locally associated with Offer ID so we can claim later
-      sessionStorage.setItem(`preimage_${res.data.id}`, preimageHex);
+      localStorage.setItem(`preimage_${res.data.id}`, preimageHex);
 
       showToast('Swap offer published successfully to the marketplace!', 'success');
       setSelectedBackingChain('');
@@ -2038,11 +2248,27 @@ export default function App() {
       if (!fundingSelection) {
         throw new Error(`insufficient split ${targetChain === 'main' ? 'BTC' : 'BIP110'} balance for the contract, coordinator fee, and network fee`);
       }
-      const acceptMessage = `accept-offer:${offer.id}:${publicKey}`;
+
+      // F9: prove ownership of a confirmed split UTXO on the counter-chain.
+      // Prefer the smallest sufficient UTXO from the wallet's split set
+      // (populated via the /api/wallet/utxos polling flow).
+      const acceptorFundingUtxo = getSplitUtxosForChain(targetChain)
+        .filter(u => u.amount >= targetAmount)
+        .sort((a, b) => a.amount - b.amount)[0];
+      if (!acceptorFundingUtxo) {
+        throw new Error(
+          `No confirmed split ${targetChain === 'main' ? 'BTC' : 'B110'} UTXO covers the required ${targetAmount} sats on the counter-chain. ` +
+          `Split/fund coins on that chain first.`
+        );
+      }
+
+      const acceptMessage = `accept-offer:${offer.id}:${publicKey}:${acceptorFundingUtxo.txid}:${acceptorFundingUtxo.vout}`;
       const acceptPair = ECPair.fromPrivateKey(Buffer.from(privateKey, 'hex'));
       const signature = Buffer.from(acceptPair.sign(bitcoin.crypto.sha256(Buffer.from(acceptMessage)))).toString('hex');
       const res = await axios.post(`${API_BASE}/offers/${offer.id}/accept`, {
         acceptorPubKey: publicKey,
+        acceptorFundingTxid: acceptorFundingUtxo.txid,
+        acceptorFundingVout: acceptorFundingUtxo.vout,
         signature
       });
       showToast('Offer accepted! Launching the Swap Wizard...', 'success');
@@ -2050,7 +2276,10 @@ export default function App() {
       setActiveTab('wizard');
       await fetchOffers();
     } catch (err: any) {
-      showToast('Accept offer failed: ' + err.message, 'error');
+      const errMsg = err.response?.status === 409
+        ? (err.response?.data?.error || 'This UTXO is already committed to another offer.')
+        : err.message;
+      showToast(`Accept offer failed: ${errMsg}`, 'error');
     }
   };
 
@@ -2069,6 +2298,16 @@ export default function App() {
         const currentHeight = await getFreshChainHeight(targetChain);
         const firstHtlcLockTime = deadlineFromHeight(currentHeight, validateLockTimeOffset(selectedOffer.lockTimeOffset));
 
+        // F2: only fund offers whose preimage was generated on this device.
+        const localPreimage = localStorage.getItem(`preimage_${selectedOffer.id}`)
+          || sessionStorage.getItem(`preimage_${selectedOffer.id}`);
+        if (!localPreimage) {
+          throw new Error('No local preimage for this offer — refusing to fund an offer this device did not create');
+        }
+        if (Buffer.from(bitcoin.crypto.sha256(Buffer.from(localPreimage, 'hex'))).toString('hex') !== selectedOffer.hashLock) {
+          throw new Error('Local preimage does not match the offer hashLock — refusing to fund');
+        }
+
         showToast(`Building ${targetChain === 'main' ? 'BTC' : 'B110'} HTLC contract locally...`, 'info');
         
         // 1. Generate HTLC outputs locally
@@ -2076,7 +2315,7 @@ export default function App() {
         const refundPubKey = Buffer.from(selectedOffer.initiatorPubKey, 'hex');
 
         const htlc = PureBitcoinSwap.createTaprootHtlc(
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           recipientPubKey,
           refundPubKey,
@@ -2130,6 +2369,11 @@ export default function App() {
         );
         const htlcVout = assertConstructedFundingOutput(tx, htlc.address!, targetSats);
 
+        const fundingChangeSats = fundingSelection.hasChange
+          ? fundingSelection.totalInputSats - targetSats - coordinatorFee - fundingSelection.feeSats
+          : 0n;
+        if (!confirmFeeDetails(fundingSelection.feeSats, fundingChangeSats)) throw new Error('Funding broadcast cancelled by user.');
+
         // 4. Broadcast via server
         const broadcastRes = await axios.post(`${API_BASE}/tx/broadcast`, {
           hex: tx.toHex(),
@@ -2175,7 +2419,7 @@ export default function App() {
 
         const isFirstHtlcValid = PureBitcoinSwap.verifyTaprootHtlcAddress(
           firstHtlcAddress,
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           firstHtlcRecipient,
           firstHtlcRefund,
@@ -2190,6 +2434,13 @@ export default function App() {
         const firstChain: 'main' | 'bip110' = isBtcBacking ? 'main' : 'bip110';
         await verifyFundingOnClient(selectedOffer, firstChain);
 
+        // F3: refuse to fund when the first HTLC expires too soon — the acceptor
+        // needs a safe window to claim or refund across both chains.
+        const firstChainHeight = await getFreshChainHeight(firstChain);
+        if (firstChainHeight + MIN_CROSS_CHAIN_SAFETY_BLOCKS >= selectedOffer.lockTime) {
+          throw new Error('Unsafe timelock window — the first HTLC expires too soon; refusing to fund');
+        }
+
         showToast(`Building ${targetChain === 'main' ? 'BTC' : 'B110'} HTLC contract locally...`, 'info');
 
         // 1. Generate second HTLC outputs locally
@@ -2202,7 +2453,7 @@ export default function App() {
         );
 
         const htlc = PureBitcoinSwap.createTaprootHtlc(
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           secondHtlcRecipient,
           secondHtlcRefund,
@@ -2241,6 +2492,11 @@ export default function App() {
           coordinatorFee
         );
         const htlcVout = assertConstructedFundingOutput(tx, htlc.address!, targetSats);
+
+        const fundingChangeSats = fundingSelection.hasChange
+          ? fundingSelection.totalInputSats - targetSats - coordinatorFee - fundingSelection.feeSats
+          : 0n;
+        if (!confirmFeeDetails(fundingSelection.feeSats, fundingChangeSats)) throw new Error('Funding broadcast cancelled by user.');
 
         // 4. Broadcast via server
         const broadcastRes = await axios.post(`${API_BASE}/tx/broadcast`, {
@@ -2285,7 +2541,7 @@ export default function App() {
 
         const isSecondHtlcValid = PureBitcoinSwap.verifyTaprootHtlcAddress(
           targetAddress,
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           secondHtlcRecipient,
           secondHtlcRefund,
@@ -2307,14 +2563,15 @@ export default function App() {
           throw new Error(`CRITICAL SECURITY WARNING: The acceptor funded the HTLC with only ${(utxo.amount / 100000000).toFixed(4)} ${targetChain === 'main' ? 'BTC' : 'B110'}, but the agreed amount was ${(requiredAmount / 100000000).toFixed(4)}! Do NOT release the preimage!`);
         }
 
-        // Retrieve local preimage securely stored
-        const savedPreimage = sessionStorage.getItem(`preimage_${selectedOffer.id}`);
-        if (!savedPreimage) throw new Error("Cryptographic preimage not found in secure local storage.");
+        // Retrieve locally persisted preimage
+        const savedPreimage = localStorage.getItem(`preimage_${selectedOffer.id}`)
+          || sessionStorage.getItem(`preimage_${selectedOffer.id}`);
+        if (!savedPreimage) throw new Error("Cryptographic preimage not found in local storage.");
 
         // Build and sign claim transaction locally!
         const keyPair = getKeyPairForPubKey(selectedOffer.initiatorPubKey, net);
         const htlcPayment = PureBitcoinSwap.createTaprootHtlc(
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           secondHtlcRecipient,
           secondHtlcRefund,
@@ -2333,11 +2590,13 @@ export default function App() {
           Buffer.from(selectedOffer.hashLock, 'hex'),
           Buffer.from(savedPreimage, 'hex'), 
           htlcPayment,
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           secondHtlcRefund,
           secondHtlcLockTime,
           net
         );
+
+        if (!confirmFeeDetails(feeSats, 0)) throw new Error('Claim broadcast cancelled by user.');
 
         // Broadcast raw tx
         const settlementRes = await axios.post(`${API_BASE}/tx/broadcast`, {
@@ -2371,7 +2630,7 @@ export default function App() {
 
         const isFirstHtlcValid = PureBitcoinSwap.verifyTaprootHtlcAddress(
           targetAddress,
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           firstHtlcRecipient,
           firstHtlcRefund,
@@ -2390,7 +2649,7 @@ export default function App() {
         // Build and sign claim transaction locally!
         const keyPair = getKeyPairForPubKey(Buffer.from(firstHtlcRecipient).toString('hex'), net);
         const htlcPayment = PureBitcoinSwap.createTaprootHtlc(
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           firstHtlcRecipient,
           firstHtlcRefund,
@@ -2409,11 +2668,13 @@ export default function App() {
           Buffer.from(selectedOffer.hashLock, 'hex'),
           Buffer.from(selectedOffer.preimage!, 'hex'), // preimage hex
           htlcPayment,
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           firstHtlcRefund,
           selectedOffer.lockTime,
           net
         );
+
+        if (!confirmFeeDetails(claimFeeSats, 0)) throw new Error('Claim broadcast cancelled by user.');
 
         const settlementRes = await axios.post(`${API_BASE}/tx/broadcast`, {
           hex: tx.toHex(),
@@ -2442,10 +2703,19 @@ export default function App() {
     showToast('Copied to clipboard!', 'success');
   };
 
-  const blockLead = nodeInfo.mainHeight - nodeInfo.bip110Height;
-  const isActivationLockout = !nodeInfo.bip110Activation.ready;
-  const isWorkLeadLockout = nodeInfo.mainHeight > 0 && nodeInfo.bip110Height > 0 && blockLead > 0 && blockLead < 10;
-  const isLockoutActive = isActivationLockout || isWorkLeadLockout;
+  // The BLAKE2b fork has its own proof-of-work, so relative block heights are
+  // not a meaningful reorg-safety signal between these chains.
+  const isActivationLockout = networkMode === 'mainnet' && !nodeInfo.bip110Activation.ready;
+  const isLockoutActive = isActivationLockout;
+  const activeRateLimits = (Object.entries(rateLimitNotices) as Array<[RateLimitedResource, number]>)
+    .filter(([, retryAt]) => retryAt > rateLimitClock);
+  const nextRateLimitRetryAt = activeRateLimits.length > 0
+    ? Math.min(...activeRateLimits.map(([, retryAt]) => retryAt))
+    : 0;
+  const rateLimitSecondsRemaining = nextRateLimitRetryAt
+    ? Math.max(1, Math.ceil((nextRateLimitRetryAt - rateLimitClock) / 1_000))
+    : 0;
+  const isWalletRateLimited = activeRateLimits.some(([resource]) => resource === 'wallet');
 
   return (
     <div className="app-shell min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
@@ -2600,7 +2870,9 @@ export default function App() {
 
             <button 
               onClick={fetchBalances}
-              className="p-2 text-slate-400 hover:text-white bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 rounded-lg transition-all"
+              disabled={isWalletRateLimited}
+              title={isWalletRateLimited ? 'Wallet refresh is paused until the request limit clears' : 'Refresh wallet'}
+              className="p-2 text-slate-400 hover:text-white bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 rounded-lg transition-all disabled:cursor-not-allowed disabled:opacity-40"
             >
               <RefreshCw className="w-4 h-4" />
             </button>
@@ -2637,6 +2909,25 @@ export default function App() {
           })}
         </div>
       </nav>
+
+      {activeRateLimits.length > 0 && (
+        <div className="border-t border-amber-500/20 bg-amber-950/95" role="alert" aria-live="assertive">
+          <div className="mx-auto flex max-w-7xl items-start gap-3 px-4 py-3 sm:items-center sm:px-6">
+            <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-amber-400/40 bg-amber-400/10 sm:mt-0">
+              <AlertTriangle className="h-4 w-4 text-amber-300" aria-hidden="true" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-black uppercase tracking-[0.14em] text-amber-200">
+                Request limit reached
+              </p>
+              <p className="mt-0.5 text-xs leading-relaxed text-amber-100/75">
+                Paused {activeRateLimits.map(([resource]) => resource).join(', ')} updates for {rateLimitSecondsRemaining}s.
+                Existing information remains visible and automatic retries will resume when the limit clears.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
 
       {/* Main Content Area */}
@@ -2650,14 +2941,14 @@ export default function App() {
             <div className="space-y-2">
               <h2 className="text-xl md:text-2xl font-bold tracking-tight text-amber-300">
                 {isActivationLockout
-                  ? 'BIP110 Consensus Rules Are Not Active Yet'
-                  : 'Consensus Safety Lockout: Insufficient Main-Chain Work Advantage'}
+                  ? 'BLAKE2b Consensus Rules Are Not Active Yet'
+                  : 'Chain State Unavailable'}
               </h2>
               <p className="text-sm text-slate-400 max-w-xl mx-auto leading-relaxed">
                 {isActivationLockout ? (
-                  <>Deposits, wallet actions, splitting, offers, and swaps are disabled until the connected Knots node reports the <strong className="text-amber-400">reduced_data deployment as ACTIVE</strong>. Miner signaling or LOCKED_IN status alone does not enforce BIP110's consensus rules.</>
+                  <>Deposits, wallet actions, splitting, offers, and swaps are disabled until the Knots chain reaches BLAKE2b activation.</>
                 ) : (
-                  <>BIP110 Knots enforces a strict subset of Bitcoin Core consensus rules. Since any block produced by a BIP110 node is automatically valid on the Main-Chain, the Core chain must maintain at least a <strong className="text-amber-400">10-block lead</strong> to prevent reorg, block replay, or chain separation vulnerabilities.</>
+                  <>The backend cannot establish the BLAKE2b chain state.</>
                 )}
               </p>
             </div>
@@ -2672,49 +2963,23 @@ export default function App() {
                 <span className="text-md font-extrabold text-sky-400 font-mono">{nodeInfo.bip110Height} blocks</span>
               </div>
               <div className="col-span-2 sm:col-span-1 bg-slate-950/80 border border-amber-950/40 px-4 py-3 rounded-xl flex flex-col justify-center">
-                <span className="text-[10px] text-amber-500/80 uppercase block font-bold mb-0.5">{isActivationLockout ? 'Deployment State' : 'Current Lead'}</span>
+                <span className="text-[10px] text-amber-500/80 uppercase block font-bold mb-0.5">{isActivationLockout ? 'Activation State' : 'Current Lead'}</span>
                 <span className={`text-md font-extrabold font-mono ${!isActivationLockout && nodeInfo.mainHeight - nodeInfo.bip110Height >= 10 ? 'text-emerald-400' : 'text-rose-400 animate-pulse'}`}>
-                  {isActivationLockout ? nodeInfo.bip110Activation.status.toUpperCase() : `${nodeInfo.mainHeight - nodeInfo.bip110Height} / 10`}
+                  {nodeInfo.bip110Activation.status.toUpperCase()}
                 </span>
               </div>
             </div>
 
-            {isActivationLockout && networkMode === 'regtest' ? (
-              <div className="pt-6 w-full max-w-xs">
-                <button
-                  onClick={() => mineBlocks('bip110', 450)}
-                  className="w-full py-3 bg-gradient-to-r from-amber-600 to-indigo-600 hover:from-amber-500 hover:to-indigo-500 text-white font-semibold text-sm rounded-xl shadow-xl shadow-indigo-600/10 transition-all flex items-center justify-center gap-2 group"
-                >
-                  <Sparkles className="w-4 h-4 text-amber-300 group-hover:scale-110 transition-transform animate-pulse" />
-                  Mine 450 Blocks to Activate
-                </button>
-                <span className="text-[10px] text-slate-500 block mt-2.5 leading-normal">
-                  Regtest only: advance both connected chains through the deployment periods, then re-check Knots' consensus state.
-                </span>
-              </div>
-            ) : networkMode === 'regtest' ? (
-              <div className="pt-6 w-full max-w-xs">
-                <button
-                  onClick={() => mineBlocks('main', 10)}
-                  className="w-full py-3 bg-gradient-to-r from-amber-600 to-indigo-600 hover:from-amber-500 hover:to-indigo-500 text-white font-semibold text-sm rounded-xl shadow-xl shadow-indigo-600/10 transition-all flex items-center justify-center gap-2 group"
-                >
-                  <Sparkles className="w-4 h-4 text-amber-300 group-hover:scale-110 transition-transform animate-pulse" />
-                  Mine +10 Blocks on Bitcoin Core
-                </button>
-                <span className="text-[10px] text-slate-500 block mt-2.5 leading-normal">
-                  Click to instantly mine 10 blocks on Core via local RPC, establishing the required work advantage and unlocking the portal.
-                </span>
-              </div>
-            ) : isActivationLockout ? (
+            {isActivationLockout ? (
               <div className="pt-6 bg-slate-950/40 border border-slate-800 p-4 rounded-2xl max-w-lg text-xs text-slate-400 leading-relaxed">
-                <strong className="text-amber-400">Fail-closed safety hold.</strong>{' '}
+                <strong className="text-amber-400">Waiting for BLAKE2b activation.</strong>{' '}
                 {nodeInfo.bip110Activation.requiredHeight
-                  ? `Knots is at block ${nodeInfo.bip110Height.toLocaleString()}. Explorer-only verification remains locked until the guaranteed activation height ${nodeInfo.bip110Activation.requiredHeight.toLocaleString()}.`
-                  : 'The backend cannot verify the Knots deployment state. Connect a reachable BIP110 RPC node to unlock from its authoritative consensus state.'}
+                  ? `Knots is at block ${nodeInfo.bip110Height.toLocaleString()}. BLAKE2b activates at block ${nodeInfo.bip110Activation.requiredHeight.toLocaleString()}.`
+                  : 'The backend cannot read the BIP110 Knots chain height.'}
               </div>
             ) : (
               <div className="pt-6 bg-slate-950/40 border border-slate-800 p-4 rounded-2xl max-w-md text-xs text-slate-400 leading-relaxed">
-                🛡️ <strong>Production Safety Hold:</strong> The system is waiting for the Main-Chain (Bitcoin Core) to extend its cumulative proof-of-work lead. The interface will automatically restore functionality as soon as the Main-Chain establishes a strict 10-block lead.
+                <strong>Chain state unavailable.</strong> Check the configured BLAKE2b node or explorer.
               </div>
             )}
           </div>
@@ -2852,7 +3117,7 @@ export default function App() {
                     Deposit Contract Details
                   </h4>
                   <p className="text-xs text-slate-400 mb-4">
-                    Technical details for the deposit address highlighted above. Scriptpath on Bitcoin, keypath on BIP110.
+                    The key path is spendable on either chain; SIGHASH_UNIFIED makes the split transaction valid only on BLAKE2b.
                   </p>
 
                   <div className="bg-slate-950 border border-slate-800 px-3 py-2.5 rounded-xl flex items-center justify-between font-mono text-xs text-sky-300 mb-4">
@@ -2910,7 +3175,7 @@ export default function App() {
                       ? 'border-rose-900/50 bg-rose-950/20 text-rose-300'
                       : 'border-amber-900/50 bg-amber-950/20 text-amber-300'
                   }`} role="status" aria-live="polite">
-                    <RefreshCw className={`h-3.5 w-3.5 ${balanceSyncStatus !== 'error' ? 'animate-spin' : ''}`} />
+                    <RefreshCw className={`h-3.5 w-3.5 ${balanceSyncStatus === 'loading' ? 'animate-spin' : ''}`} />
                     {balanceSyncStatus === 'rate-limited'
                       ? 'Wallet service is busy. Keeping the last confirmed balances and retrying shortly…'
                       : balanceSyncStatus === 'error'
@@ -3021,8 +3286,8 @@ export default function App() {
                     {/* Step 1: Fund Nodes */}
                     <div className="bg-slate-950 p-4 rounded-xl border border-slate-850 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                       <div className="max-w-md">
-                        <h4 className="text-xs font-bold text-slate-200 mb-1">Step 1: Bootstrap BIP110 Consensus & Miner Wallets</h4>
-                        <p className="text-[10px] text-slate-400">Mine 450 blocks of shared history to activate BIP110 consensus on Knots and mature Coinbase miner rewards.</p>
+                        <h4 className="text-xs font-bold text-slate-200 mb-1">Step 1: Create Shared History Before Activation</h4>
+                        <p className="text-[10px] text-slate-400">Mine 110 shared blocks, use the Bitcoin faucet once (it confirms the shared deposit at 111), then mine the BLAKE2b chain from activation block 112.</p>
                       </div>
                       <button
                         onClick={() => mineBlocks('main', 450)}
@@ -3089,7 +3354,7 @@ export default function App() {
             >
               {balanceSyncStatus !== 'ready' && (
                 <div className="mb-4 flex items-center gap-2 rounded-xl border border-amber-900/40 bg-amber-950/15 px-3 py-2.5 text-xs text-amber-300" role="status">
-                  <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                  <RefreshCw className={`h-3.5 w-3.5 ${balanceSyncStatus === 'loading' ? 'animate-spin' : ''}`} />
                   {balanceSyncStatus === 'rate-limited'
                     ? 'Rate limited — retaining the last complete UTXO snapshot while we wait to retry.'
                     : hasBalanceSnapshot
@@ -3326,6 +3591,117 @@ export default function App() {
                 </div>
               </form>
             </CollapsibleCard>
+
+            {/* BIP110 RAW TRANSACTION RELAY */}
+            <CollapsibleCard
+              title="Relay a Transaction to BIP110"
+              icon={Globe}
+              defaultOpen={false}
+            >
+              <div className="space-y-6 pt-2">
+            <section className="relative overflow-hidden rounded-2xl border border-sky-500/30 bg-slate-950 shadow-2xl shadow-sky-950/20">
+              <div className="absolute inset-y-0 left-0 w-1.5 bg-gradient-to-b from-sky-300 via-cyan-400 to-emerald-400" />
+              <div className="p-6 pl-8 sm:p-8 sm:pl-10">
+                <div className="mb-7 flex items-start gap-4">
+                  <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-sky-400/30 bg-sky-400/10">
+                    <Globe className="h-5 w-5 text-sky-300" />
+                  </div>
+                  <div>
+                    <span className="mb-2 inline-block rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1 text-[10px] font-black uppercase tracking-[0.18em] text-sky-300">
+                      BIP110 broadcast utility
+                    </span>
+                    <h2 className="text-xl font-bold tracking-tight text-white sm:text-2xl">Relay a signed transaction to Knots</h2>
+                    <p className="mt-2 max-w-2xl text-sm leading-relaxed text-slate-400">
+                      If your wallet broadcast only to Bitcoin after the chains separated, paste the same signed raw transaction here to submit it directly to the BIP110 network.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="mb-6 grid gap-3 sm:grid-cols-3">
+                  {[
+                    ['1', 'Create and sign', 'Use your existing wallet'],
+                    ['2', 'Copy raw hex', 'Do not paste a PSBT'],
+                    ['3', 'Relay to BIP110', networkMode === 'regtest' ? 'Via local Knots RPC' : 'Via the configured Knots source']
+                  ].map(([number, title, detail]) => (
+                    <div key={number} className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
+                      <span className="text-[10px] font-black tracking-widest text-sky-400">STEP {number}</span>
+                      <strong className="mt-1 block text-xs text-slate-200">{title}</strong>
+                      <span className="mt-1 block text-[11px] text-slate-500">{detail}</span>
+                    </div>
+                  ))}
+                </div>
+
+                <form onSubmit={submitBip110Transaction} className="space-y-4">
+                  <div>
+                    <label htmlFor="bip110-raw-transaction" className="mb-2 block text-xs font-bold uppercase tracking-wider text-slate-400">
+                      Signed raw transaction hex
+                    </label>
+                    <textarea
+                      id="bip110-raw-transaction"
+                      value={relayTransactionHex}
+                      onChange={(event) => {
+                        setRelayTransactionHex(event.target.value);
+                        setRelayResult(null);
+                      }}
+                      spellCheck={false}
+                      autoComplete="off"
+                      rows={8}
+                      placeholder="020000000001..."
+                      className="w-full resize-y rounded-xl border border-slate-800 bg-black/35 px-4 py-3 font-mono text-xs leading-6 text-sky-200 outline-none transition focus:border-sky-500/70 focus:ring-2 focus:ring-sky-500/10"
+                    />
+                    <p className="mt-2 text-[11px] leading-relaxed text-slate-500">
+                      Raw transaction hex is the canonical serialized transaction produced after signing. Private keys, seed phrases, wallet files, and PSBTs are never required.
+                    </p>
+                  </div>
+
+                  {relayPreview && (
+                    'error' in relayPreview ? (
+                      <div className="flex items-center gap-2 rounded-xl border border-rose-500/25 bg-rose-500/10 px-4 py-3 text-xs text-rose-300">
+                        <AlertTriangle className="h-4 w-4 shrink-0" /> {relayPreview.error}
+                      </div>
+                    ) : (
+                      <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/[0.06] p-4">
+                        <div className="mb-3 flex items-center gap-2 text-xs font-bold text-emerald-300">
+                          <CheckCircle className="h-4 w-4" /> Transaction decoded locally
+                        </div>
+                        <dl className="grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
+                          <div><dt className="text-slate-500">Size</dt><dd className="mt-1 font-mono text-slate-200">{relayPreview.bytes} bytes</dd></div>
+                          <div><dt className="text-slate-500">Virtual size</dt><dd className="mt-1 font-mono text-slate-200">{relayPreview.virtualSize} vB</dd></div>
+                          <div><dt className="text-slate-500">Inputs</dt><dd className="mt-1 font-mono text-slate-200">{relayPreview.inputs}</dd></div>
+                          <div><dt className="text-slate-500">Outputs</dt><dd className="mt-1 font-mono text-slate-200">{relayPreview.outputs}</dd></div>
+                        </dl>
+                        <div className="mt-3 border-t border-emerald-500/10 pt-3">
+                          <span className="text-[10px] uppercase tracking-wider text-slate-500">Expected TXID</span>
+                          <code className="mt-1 block break-all text-[11px] text-emerald-200">{relayPreview.txid}</code>
+                        </div>
+                      </div>
+                    )
+                  )}
+
+                  {relayResult && (
+                    <div className="rounded-xl border border-sky-400/30 bg-sky-400/10 p-4 text-sm text-sky-100">
+                      <strong className="flex items-center gap-2"><CheckCircle className="h-4 w-4" /> Accepted by BIP110</strong>
+                      <code className="mt-2 block break-all text-xs text-sky-200">{relayResult.txid}</code>
+                    </div>
+                  )}
+
+                  <button
+                    type="submit"
+                    disabled={relaySubmitting || !relayPreview || 'error' in relayPreview}
+                    className="flex w-full items-center justify-center gap-2 rounded-xl bg-sky-500 px-5 py-3 text-sm font-black text-slate-950 shadow-lg shadow-sky-500/10 transition hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-35"
+                  >
+                    {relaySubmitting ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Globe className="h-4 w-4" />}
+                    {relaySubmitting ? 'Submitting to BIP110…' : 'Submit to BIP110 network'}
+                  </button>
+                </form>
+              </div>
+            </section>
+
+            <div className="rounded-xl border border-amber-500/20 bg-amber-500/[0.06] px-5 py-4 text-xs leading-relaxed text-amber-100/80">
+              <strong className="text-amber-300">Before submitting:</strong> verify the transaction spends the intended inputs and pays the intended outputs. The relay broadcasts exactly what you paste and cannot reverse a confirmed transaction.
+            </div>
+              </div>
+            </CollapsibleCard>
           </div>
         )}
 
@@ -3338,7 +3714,7 @@ export default function App() {
               defaultOpen={true}
             >
               <p className="text-xs text-slate-400 mb-6">
-                Split your coins to protect them from replay risk and secure your balances before funding HTLCs.
+                  Split with SIGHASH_UNIFIED on the BLAKE2b chain so the transaction cannot replay on Bitcoin.
               </p>
 
               {/* Dynamic Read-only Split Destination Panel */}
@@ -3491,7 +3867,7 @@ export default function App() {
                       disabled={splittingBilateral || !selectedUtxoToSplit}
                       className="w-full sm:w-auto px-6 py-3 font-semibold text-sm rounded-xl text-white bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 transition-all flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/10"
                     >
-                      {splittingBilateral ? 'Executing Main-Chain Scriptpath Spend...' : 'Split Coins (Scriptpath Spend)'}
+                      {splittingBilateral ? 'Signing SIGHASH_UNIFIED Spend...' : 'Split Coins (SIGHASH_UNIFIED)'}
                     </button>
                   )}
                 </div>
@@ -3502,17 +3878,17 @@ export default function App() {
                     <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider">Split spend Results Summary</h4>
                     
                     <div className="grid grid-cols-1 gap-4 text-xs font-mono">
-                      <div className={`p-4 rounded-xl border ${bilateralSplitResult.mainSuccess ? 'bg-emerald-950/20 border-emerald-900/60 text-emerald-300' : 'bg-rose-950/20 border-rose-900/60 text-rose-300'}`}>
-                        <span className="font-bold block mb-1">Bitcoin Core (Main-Chain Scriptpath spend):</span>
-                        {bilateralSplitResult.mainSuccess ? (
+                      <div className={`p-4 rounded-xl border ${bilateralSplitResult.bip110Success ? 'bg-emerald-950/20 border-emerald-900/60 text-emerald-300' : 'bg-rose-950/20 border-rose-900/60 text-rose-300'}`}>
+                        <span className="font-bold block mb-1">BLAKE2b chain (unified key-path spend):</span>
+                        {bilateralSplitResult.bip110Success ? (
                           <div>
-                            <div className="truncate mb-1">✔️ Success! Split Txid: {bilateralSplitResult.mainTxid}</div>
+                            <div className="truncate mb-1">✔️ Success! Split Txid: {bilateralSplitResult.bip110Txid}</div>
                             <div className="text-[10px] text-slate-400 leading-normal mt-2">
-                              Contains banned OP_IF, so BIP110-Chain will reject it, keeping your coins safely split on Knots.
+                              Bitcoin rejects the 0x21 hash type, so the original output remains spendable there.
                             </div>
                           </div>
                         ) : (
-                          <div>Failed: {bilateralSplitResult.mainError}</div>
+                          <div>Failed: {bilateralSplitResult.bip110Error}</div>
                         )}
                       </div>
                     </div>
@@ -3583,13 +3959,14 @@ export default function App() {
                           </label>
                           <input
                             type="number"
-                            min="100000"
+                            min={MIN_OFFER_AMOUNT_SATS}
                             value={sellAmountSats}
                             onChange={(e) => handleSellAmountChange(e.target.value)}
                             placeholder={`Up to aggregate balance minus fees`}
                             className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 font-mono"
                           />
                           <span className="text-[10px] text-slate-500 mt-1 block">
+                            Minimum offer: <span className="font-semibold text-slate-400">{MIN_OFFER_AMOUNT_SATS.toLocaleString()} sats</span>.{' '}
                             Aggregate split balance: <span className="font-semibold text-slate-400">{aggregateBalance.toLocaleString()} Sats</span> ({(aggregateBalance / 100000000).toFixed(4)} {chainLabel}) across {fundingCandidates.length} UTXO{fundingCandidates.length === 1 ? '' : 's'}. Fees must also fit within this balance.
                           </span>
                           <span className="text-[10px] text-slate-600 mt-1 block">

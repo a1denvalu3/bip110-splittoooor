@@ -4,14 +4,16 @@ import axios from 'axios';
 import { ECPairFactory } from 'ecpair';
 import * as ecc from 'tiny-secp256k1';
 import * as bitcoin from 'bitcoinjs-lib';
-import { ExplorerChain, ExplorerRequestError, MempoolExplorerClient } from './explorer';
+import { ExplorerChain, ExplorerRequestError, MempoolExplorerClient, RotatingExplorerClient } from './explorer';
 import { assertCoordinatorFee, loadCoordinatorFeeConfig } from './coordinatorFees';
 import { randomUUID } from 'crypto';
 import { logError, logInfo, logWarn } from './logger';
 import { PureBitcoinSwap } from '../../src/lib/PureBitcoinSwap';
 import { MIN_CROSS_CHAIN_SAFETY_BLOCKS, assertFundingDeadline, secondLockTimeOffset, validateLockTimeOffset } from '../../src/lib/timelocks';
-import { activationFromBlockchainInfo, mainnetHeightFallback, unavailableActivation } from '../../src/lib/bip110Activation';
+import { activationFromBlockchainInfo, mainnetActivationFromHeight, unavailableActivation } from '../../src/lib/bip110Activation';
 import { cachedExplorerRead, closeCache } from './cache';
+import { parseRawTransactionHex } from './transactionSubmission';
+import { MIN_OFFER_AMOUNT_SATS } from '../../src/lib/offerPolicy';
 
 import { runMigrations } from './database/migrations';
 import {
@@ -37,13 +39,16 @@ const cacheTtl = (name: string, fallback: number): number => {
     return value;
 };
 const EXPLORER_CACHE_TTL = {
-    tip: cacheTtl('EXPLORER_TIP_CACHE_SECONDS', 10),
-    utxos: cacheTtl('EXPLORER_UTXO_CACHE_SECONDS', 15),
-    confirmations: cacheTtl('EXPLORER_CONFIRMATION_CACHE_SECONDS', 15),
+    tip: cacheTtl('EXPLORER_TIP_CACHE_SECONDS', 20),
+    utxos: cacheTtl('EXPLORER_UTXO_CACHE_SECONDS', 60),
+    confirmations: cacheTtl('EXPLORER_CONFIRMATION_CACHE_SECONDS', 60),
     rawTransaction: cacheTtl('EXPLORER_RAW_TX_CACHE_SECONDS', 86400),
-    fees: cacheTtl('EXPLORER_FEE_CACHE_SECONDS', 30)
+    fees: cacheTtl('EXPLORER_FEE_CACHE_SECONDS', 60)
 };
 
+// The production backend is exactly one hop behind nginx. This also covers the
+// Docker bridge address seen when nginx proxies to a loopback-published port.
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
 
@@ -72,13 +77,24 @@ app.use((req: Request, res: Response, next: any) => {
 });
 
 // In-memory rate-limiter database and middleware
+const RATE_LIMIT_MAX_KEYS = 100000;
 const rateLimitDb: Record<string, { count: number; resetTime: number }> = {};
+// Periodically evict expired entries so the map cannot grow unboundedly.
+setInterval(() => {
+    const now = Date.now();
+    for (const ip of Object.keys(rateLimitDb)) {
+        if (now > rateLimitDb[ip].resetTime) delete rateLimitDb[ip];
+    }
+}, 60000).unref();
 const rateLimiter = (limit: number, windowMs: number) => {
     return (req: Request, res: Response, next: any) => {
         const ip = req.ip || req.socket.remoteAddress || 'unknown';
         const now = Date.now();
         
         if (!rateLimitDb[ip]) {
+            if (Object.keys(rateLimitDb).length >= RATE_LIMIT_MAX_KEYS) {
+                return res.status(429).json({ error: 'Too many requests. Please slow down.' });
+            }
             rateLimitDb[ip] = {
                 count: 1,
                 resetTime: now + windowMs
@@ -107,8 +123,8 @@ const rateLimiter = (limit: number, windowMs: number) => {
     };
 };
 
-// Accommodates intense parallel loops from multi-index HD wallet balance scans (up to 600 req/min)
-app.use('/api', rateLimiter(600, 60000));
+// Accommodates parallel loops from multi-index HD wallet balance scans (up to 300 req/min)
+app.use('/api', rateLimiter(300, 60000));
 
 // Parse command-line arguments and environment variables for network mode
 const args = process.argv.slice(2);
@@ -121,20 +137,33 @@ console.log(`[BOOT] BIP110 Splittoooor Backend starting up in [${NETWORK_MODE.to
 console.log(`[BOOT] Coordinator fees: maker=${COORDINATOR_FEES.makerFeePercent}%, taker=${COORDINATOR_FEES.takerFeePercent}%.`);
 
 const BITCOIN_EXPLORER_URL = (process.env.BITCOIN_EXPLORER_URL || 'https://mempool.space').trim();
+const BITCOIN_EXPLORER_URLS = (process.env.BITCOIN_EXPLORER_URLS || BITCOIN_EXPLORER_URL)
+    .split(',')
+    .map(url => url.trim())
+    .filter((url, index, urls) => url.length > 0 && urls.indexOf(url) === index);
 const BIP110_EXPLORER_URL = process.env.BIP110_EXPLORER_URL?.trim() || '';
 const BITCOIN_RPC_HOST = process.env.BITCOIN_RPC_HOST?.trim() || '';
 const BIP110_RPC_HOST = process.env.BIP110_RPC_HOST?.trim() || '';
-const mainnetExplorer = BITCOIN_RPC_HOST ? null : new MempoolExplorerClient(BITCOIN_EXPLORER_URL);
+const mainnetExplorer = BITCOIN_RPC_HOST ? null : new RotatingExplorerClient(
+    BITCOIN_EXPLORER_URLS.map(url => new MempoolExplorerClient(url)),
+    (from, to, error) => logWarn('explorer.endpoint_failover', {
+        chain: 'main',
+        from,
+        to,
+        reason: error instanceof Error ? error.message : String(error),
+        status: error instanceof ExplorerRequestError ? error.status : undefined
+    })
+);
 const bip110Explorer = !BIP110_RPC_HOST && BIP110_EXPLORER_URL
     ? new MempoolExplorerClient(BIP110_EXPLORER_URL)
     : null;
 
 if (NETWORK_MODE === 'mainnet') {
-    console.log(`[BOOT] Bitcoin Mainnet source: [${BITCOIN_RPC_HOST ? 'RPC' : BITCOIN_EXPLORER_URL}]`);
+    console.log(`[BOOT] Bitcoin Mainnet source: [${BITCOIN_RPC_HOST ? 'RPC' : BITCOIN_EXPLORER_URLS.join(', ')}]`);
     console.log(`[BOOT] BIP110 Mainnet source: [${BIP110_RPC_HOST ? 'RPC' : (BIP110_EXPLORER_URL || 'MISSING')}]`);
 }
 
-function getMainnetExplorer(chain: ExplorerChain): MempoolExplorerClient {
+function getMainnetExplorer(chain: ExplorerChain): MempoolExplorerClient | RotatingExplorerClient {
     const explorer = chain === 'main' ? mainnetExplorer : bip110Explorer;
     if (!explorer) throw new Error(`No explorer configured for ${chain}`);
     return explorer;
@@ -144,8 +173,8 @@ function sendExplorerError(res: Response, error: unknown, operation: string) {
     const message = error instanceof Error ? error.message : String(error);
     logError('explorer.error', { requestId: res.locals.requestId, operation, error: message });
     return res.status(502).json({
-        error: `Chain data source unavailable during ${operation}`,
-        detail: message
+        error: 'Chain data source unavailable',
+        requestId: res.locals.requestId
     });
 }
 
@@ -291,9 +320,9 @@ async function mineRegtestBlocks(rpc: BitcoinRpc, blocks: number): Promise<strin
     return rpc.call('generatetoaddress', [blocks, minerAddress]);
 }
 
-// Never advance the lower-work BIP110 simulation without advancing Core first.
-// This mirrors the expected production ordering and prevents Knots from becoming
-// the longer chain during refund fast-forwards.
+// When asked to advance the fork in regtest, advance both independent chains so
+// UI deadlines remain convenient to compare. Their different PoW algorithms
+// mean relative height is not a cross-chain reorg-safety property.
 async function mineRegtestChain(chain: 'main' | 'bip110', blocks: number): Promise<{
     coreHashes: string[];
     bip110Hashes: string[];
@@ -378,7 +407,10 @@ app.get('/api/fees/coordinator', (_req: Request, res: Response) => {
 function productionSourceId(chain: ExplorerChain): string {
     const prefix = chain === 'main' ? 'BITCOIN' : 'BIP110';
     const host = chain === 'main' ? BITCOIN_RPC_HOST : BIP110_RPC_HOST;
-    if (!host) return getMainnetExplorer(chain).baseUrl;
+    if (!host) {
+        const explorer = getMainnetExplorer(chain);
+        return explorer instanceof RotatingExplorerClient ? explorer.sourceId : explorer.baseUrl;
+    }
     return `rpc:${host}:${process.env[`${prefix}_RPC_PORT`] || 8332}`;
 }
 
@@ -387,14 +419,16 @@ function cachedProductionRead<T>(
     operation: string,
     parameters: unknown,
     ttlSeconds: number,
-    loader: () => Promise<T>
+    loader: () => Promise<T>,
+    staleIfError = false,
+    onStaleFallback?: (error: unknown) => void
 ): Promise<T> {
     return cachedExplorerRead(operation, {
         network: NETWORK_MODE,
         chain,
         explorer: productionSourceId(chain),
         parameters
-    }, ttlSeconds, loader);
+    }, ttlSeconds, loader, staleIfError, onStaleFallback);
 }
 
 async function currentChainHeight(chain: ExplorerChain): Promise<number> {
@@ -499,25 +533,39 @@ async function getRawTransaction(txid: string, chain: ExplorerChain): Promise<st
     return rpc.call('getrawtransaction', [txid, false]);
 }
 
+// Deterministic serialization for signed endpoint messages. The client must
+// mirror this exactly: keys sorted, undefined values dropped.
+const canonicalStringify = (obj: any): string => {
+    const keys = Object.keys(obj).sort();
+    const sortedObj: Record<string, any> = {};
+    for (const key of keys) {
+        if (obj[key] !== undefined) {
+            sortedObj[key] = obj[key];
+        }
+    }
+    return JSON.stringify(sortedObj);
+};
+
 async function assertConfirmedChainExclusiveOutpoint(txid: string, vout: number, chain: ExplorerChain): Promise<void> {
     if (await getTxConfirmations(txid, chain, NETWORK_MODE) < 1) throw new Error(`Transaction ${txid} is not confirmed on ${chain}`);
     const opposite: ExplorerChain = chain === 'main' ? 'bip110' : 'main';
     let oppositeHasOutpoint = false;
     if (NETWORK_MODE === 'regtest') {
         const rpc = opposite === 'bip110' ? bip110MinerRpc : mainMinerRpc;
-        oppositeHasOutpoint = (await rpc.call('gettxout', [txid, vout, true])) !== null;
+        // include_mempool=false: only a CONFIRMED spend clears the outpoint.
+        oppositeHasOutpoint = (await rpc.call('gettxout', [txid, vout, false])) !== null;
     } else {
         const raw = await getRawTransaction(txid, chain);
         const transaction = bitcoin.Transaction.fromHex(raw);
         if (!Number.isSafeInteger(vout) || vout < 0 || vout >= transaction.outs.length) throw new Error('Invalid split output index');
         const oppositeRpc = getProductionRpc(opposite);
         if (oppositeRpc) {
-            oppositeHasOutpoint = (await oppositeRpc.call('gettxout', [txid, vout, true])) !== null;
+            oppositeHasOutpoint = (await oppositeRpc.call('gettxout', [txid, vout, false])) !== null;
         } else {
-            const network = bitcoin.networks.bitcoin;
-            const address = bitcoin.address.fromOutputScript(transaction.outs[vout].script, network);
-            const oppositeUtxos = await cachedProductionRead(opposite, 'address-utxos', { address }, EXPLORER_CACHE_TTL.utxos, () => getProductionUtxos(opposite, address));
-            oppositeHasOutpoint = oppositeUtxos.some((output: { txid: string; vout: number }) => output.txid === txid && output.vout === vout);
+            // Direct outspend lookup (no cache): a mempool-only spend must NOT
+            // count; a tx unknown on the opposite chain is chain-exclusive.
+            const outspend = await getMainnetExplorer(opposite).getOutspend(txid, vout);
+            oppositeHasOutpoint = outspend !== null && !(outspend.spent && outspend.confirmed);
         }
     }
     if (oppositeHasOutpoint) throw new Error(`Outpoint ${txid}:${vout} is still unspent on ${opposite} and is replayable`);
@@ -551,7 +599,7 @@ app.get('/api/offers', async (req: Request, res: Response) => {
             acceptorPubKey 
         });
 
-        const updatedOffers = await Promise.all(paginatedResult.offers.map(async o => {
+        const enrichOffer = async (o: Offer) => {
             let isPending = false;
             
             // 1. Check if the backing split UTXO is confirmed
@@ -598,7 +646,14 @@ app.get('/api/offers', async (req: Request, res: Response) => {
                 acceptorClaimed: o.acceptorClaimed === 1,
                 isPending
             };
-        }));
+        };
+
+        // Bound the confirmation-lookup fan-out: sequential batches of 10.
+        const updatedOffers = [];
+        for (let i = 0; i < paginatedResult.offers.length; i += 10) {
+            const batch = paginatedResult.offers.slice(i, i + 10);
+            updatedOffers.push(...await Promise.all(batch.map(enrichOffer)));
+        }
 
         res.json({
             offers: updatedOffers,
@@ -611,13 +666,14 @@ app.get('/api/offers', async (req: Request, res: Response) => {
         if (err instanceof ExplorerRequestError) {
             return sendExplorerError(res, err, 'offer confirmation lookup');
         }
-        res.status(500).json({ error: "Failed to load offers from database: " + err.message });
+        logError('offer.list_failed', { requestId: res.locals.requestId, error: err.message });
+        res.status(500).json({ error: "Failed to load offers from database" });
     }
 });
 
 // 2. Create a Marketplace Offer
 app.post('/api/offers', async (req: Request, res: Response) => {
-    const { initiatorPubKey, initiatorB110Amount, acceptorBtcAmount, hashLock, lockTimeOffset, backingTxid, backingVout, backingChain } = req.body;
+    const { initiatorPubKey, initiatorB110Amount, acceptorBtcAmount, hashLock, lockTimeOffset, backingTxid, backingVout, backingChain, numsTweak, signature } = req.body;
 
     if (!initiatorPubKey || !initiatorB110Amount || !acceptorBtcAmount || !hashLock || lockTimeOffset === undefined) {
         return res.status(400).json({ error: "Missing required parameters" });
@@ -631,15 +687,47 @@ app.post('/api/offers', async (req: Request, res: Response) => {
     if (!/^(02|03)[0-9a-f]{64}$/i.test(initiatorPubKey) || !/^[0-9a-f]{64}$/i.test(hashLock)) {
         return res.status(400).json({ error: 'Invalid initiator public key or hash lock' });
     }
-    if (![b110Amount, btcAmount].every(Number.isSafeInteger) || b110Amount <= 0 || btcAmount <= 0) {
-        return res.status(400).json({ error: 'Amounts must be positive safe integers' });
+    if (![b110Amount, btcAmount].every(Number.isSafeInteger) || b110Amount < MIN_OFFER_AMOUNT_SATS || btcAmount < MIN_OFFER_AMOUNT_SATS) {
+        return res.status(400).json({ error: `Offer amounts must each be at least ${MIN_OFFER_AMOUNT_SATS.toLocaleString()} sats` });
+    }
+    if (typeof numsTweak !== 'string' || !/^[0-9a-f]{64}$/.test(numsTweak)) {
+        return res.status(400).json({ error: 'A valid 64-character lowercase-hex NUMS tweak is required' });
+    }
+    if (typeof signature !== 'string' || !/^[0-9a-f]{128,144}$/i.test(signature)) {
+        return res.status(400).json({ error: 'A valid creation signature is required' });
     }
     if (!/^[0-9a-f]{64}$/i.test(backingTxid || '') || !Number.isSafeInteger(Number(backingVout)) || Number(backingVout) < 0
         || (backingChain !== 'main' && backingChain !== 'bip110')) {
         return res.status(400).json({ error: 'A valid confirmed split backing outpoint and chain are required' });
     }
+
+    // Only the owner of the initiator key may publish an offer under it.
+    try {
+        const offerFields = { initiatorPubKey, initiatorB110Amount, acceptorBtcAmount, hashLock, lockTimeOffset, backingTxid, backingVout, backingChain, numsTweak };
+        const msgHash = bitcoin.crypto.sha256(Buffer.from(`create-offer:${canonicalStringify(offerFields)}`));
+        const verified = ECPair.fromPublicKey(Buffer.from(initiatorPubKey, 'hex'))
+            .verify(msgHash, Buffer.from(signature, 'hex'));
+        if (!verified) return res.status(401).json({ error: 'Invalid offer creation signature' });
+    } catch (sigErr: any) {
+        return res.status(401).json({ error: 'Invalid offer creation signature' });
+    }
+
     try { await assertConfirmedChainExclusiveOutpoint(backingTxid, Number(backingVout), backingChain); }
     catch (error: any) { return res.status(400).json({ error: `Unsafe backing transaction: ${error.message}` }); }
+
+    // The backing outpoint must be a split output owned by the initiator key.
+    try {
+        const network = NETWORK_MODE === 'mainnet' ? bitcoin.networks.bitcoin : bitcoin.networks.regtest;
+        const backingTx = bitcoin.Transaction.fromHex(await getRawTransaction(backingTxid, backingChain));
+        const vout = Number(backingVout);
+        if (vout >= backingTx.outs.length) throw new Error('Invalid backing output index');
+        const expectedOutput = PureBitcoinSwap.createSplitPayment(Buffer.from(initiatorPubKey, 'hex'), network).payment.output;
+        if (!expectedOutput || !Buffer.from(backingTx.outs[vout].script).equals(Buffer.from(expectedOutput))) {
+            throw new Error('Backing outpoint is not a split output owned by the initiator public key');
+        }
+    } catch (error: any) {
+        return res.status(400).json({ error: `Invalid backing outpoint: ${error.message}` });
+    }
 
     const id = Math.random().toString(36).substring(2, 11);
 
@@ -652,7 +740,8 @@ app.post('/api/offers', async (req: Request, res: Response) => {
             hashLock,
             lockTimeOffset: agreedOffset,
             networkMode: NETWORK_MODE,
-            backingTxid: backingTxid || null,
+            numsTweak,
+            backingTxid: backingTxid.toLowerCase(),
             backingVout: backingVout !== undefined ? Number(backingVout) : null,
             backingChain: backingChain || null
         });
@@ -674,18 +763,25 @@ app.post('/api/offers', async (req: Request, res: Response) => {
             acceptorClaimed: newOffer?.acceptorClaimed === 1
         });
     } catch (err: any) {
+        if (String(err.message).includes('UNIQUE constraint failed')) {
+            return res.status(409).json({ error: 'This backing UTXO is already committed to another offer' });
+        }
         logError('offer.create_failed', { requestId: res.locals.requestId, error: err.message });
-        res.status(500).json({ error: "Failed to store offer in database: " + err.message });
+        res.status(500).json({ error: "Failed to store offer in database" });
     }
 });
 
 // 3. Accept a Marketplace Offer
 app.post('/api/offers/:id/accept', async (req: Request, res: Response) => {
     const id = req.params.id as string;
-    const { acceptorPubKey, signature } = req.body;
+    const { acceptorPubKey, signature, acceptorFundingTxid, acceptorFundingVout } = req.body;
 
     if (!acceptorPubKey || !signature || !/^(02|03)[0-9a-f]{64}$/i.test(acceptorPubKey) || !/^[0-9a-f]{128,144}$/i.test(signature)) {
         return res.status(400).json({ error: "A valid acceptorPubKey and signature are required" });
+    }
+    if (typeof acceptorFundingTxid !== 'string' || !/^[0-9a-f]{64}$/i.test(acceptorFundingTxid)
+        || !Number.isSafeInteger(Number(acceptorFundingVout)) || Number(acceptorFundingVout) < 0) {
+        return res.status(400).json({ error: "A valid acceptor funding outpoint is required" });
     }
 
     try {
@@ -696,12 +792,37 @@ app.post('/api/offers/:id/accept', async (req: Request, res: Response) => {
         if (offer.status !== 'OPEN') {
             return res.status(400).json({ error: "Offer is not in OPEN status" });
         }
+        if (!offer.backingChain) {
+            return res.status(400).json({ error: "Offer has no backing chain" });
+        }
 
-        const messageHash = bitcoin.crypto.sha256(Buffer.from(`accept-offer:${id}:${acceptorPubKey}`));
+        const messageHash = bitcoin.crypto.sha256(Buffer.from(`accept-offer:${id}:${acceptorPubKey}:${acceptorFundingTxid}:${acceptorFundingVout}`));
         const verified = ECPair.fromPublicKey(Buffer.from(acceptorPubKey, 'hex'))
             .verify(messageHash, Buffer.from(signature, 'hex'));
         if (!verified) return res.status(401).json({ error: 'Invalid acceptance signature' });
-        if (!await acceptOfferById(id, acceptorPubKey)) {
+
+        // The acceptor must prove a funded split UTXO on the chain they fund
+        // (the chain opposite to the offer's backing chain).
+        const acceptorChain: ExplorerChain = offer.backingChain === 'main' ? 'bip110' : 'main';
+        const fundingVout = Number(acceptorFundingVout);
+        try {
+            const network = NETWORK_MODE === 'mainnet' ? bitcoin.networks.bitcoin : bitcoin.networks.regtest;
+            const expectedOutput = PureBitcoinSwap.createSplitPayment(Buffer.from(acceptorPubKey, 'hex'), network).payment.output;
+            const fundingTx = bitcoin.Transaction.fromHex(await getRawTransaction(acceptorFundingTxid, acceptorChain));
+            if (fundingVout >= fundingTx.outs.length) throw new Error('Invalid acceptor funding output index');
+            const output = fundingTx.outs[fundingVout];
+            if (!expectedOutput || !Buffer.from(output.script).equals(Buffer.from(expectedOutput))) {
+                throw new Error('Funding outpoint is not a split output owned by the acceptor public key');
+            }
+            if (output.value < BigInt(acceptorChain === 'main' ? offer.acceptorBtcAmount : offer.initiatorB110Amount)) {
+                throw new Error('Funding outpoint amount is below the agreed acceptor amount');
+            }
+            await assertConfirmedChainExclusiveOutpoint(acceptorFundingTxid, fundingVout, acceptorChain);
+        } catch (proofErr: any) {
+            return res.status(400).json({ error: `Invalid acceptor funding proof: ${proofErr.message}` });
+        }
+
+        if (!await acceptOfferById(id, acceptorPubKey, acceptorFundingTxid.toLowerCase(), fundingVout)) {
             return res.status(409).json({ error: 'Offer was already accepted by another participant' });
         }
         logInfo('offer.accepted', { requestId: res.locals.requestId, id });
@@ -721,8 +842,11 @@ app.post('/api/offers/:id/accept', async (req: Request, res: Response) => {
             acceptorClaimed: updated?.acceptorClaimed === 1
         });
     } catch (err: any) {
+        if (String(err.message).includes('UNIQUE constraint failed')) {
+            return res.status(409).json({ error: 'This funding UTXO is already committed to another offer' });
+        }
         logError('offer.accept_failed', { requestId: res.locals.requestId, id, error: err.message });
-        res.status(500).json({ error: "Database error during acceptance: " + err.message });
+        res.status(500).json({ error: "Database error during acceptance" });
     }
 });
 
@@ -762,17 +886,6 @@ app.post('/api/offers/:id/update', async (req: Request, res: Response) => {
         }
 
         // 2. Build canonical message for deterministic verification
-        const canonicalStringify = (obj: any): string => {
-            const keys = Object.keys(obj).sort();
-            const sortedObj: Record<string, any> = {};
-            for (const key of keys) {
-                if (obj[key] !== undefined) {
-                    sortedObj[key] = obj[key];
-                }
-            }
-            return JSON.stringify(sortedObj);
-        };
-
         const msg = `update-offer:${id}:${canonicalStringify(fields)}`;
         
         // 3. Cryptographically verify signature
@@ -825,6 +938,9 @@ app.post('/api/offers/:id/update', async (req: Request, res: Response) => {
             const escrowChain: ExplorerChain = spendsFirst ? offer.backingChain! : (offer.backingChain === 'main' ? 'bip110' : 'main');
             const escrowTxid = escrowChain === 'main' ? offer.btcHtlcTxid : offer.b110HtlcTxid;
             const escrowVout = escrowChain === 'main' ? offer.btcHtlcVout : offer.b110HtlcVout;
+            if (await getTxConfirmations(settlementTxid, escrowChain, NETWORK_MODE) < 1) {
+                return res.status(400).json({ error: 'Settlement transaction is not confirmed' });
+            }
             const settlement = bitcoin.Transaction.fromHex(await getRawTransaction(settlementTxid, escrowChain));
             const spendsCommittedOutpoint = settlement.ins.some(input => Buffer.from(input.hash).reverse().toString('hex') === escrowTxid && input.index === escrowVout);
             if (!spendsCommittedOutpoint) return res.status(400).json({ error: 'Settlement transaction does not spend the committed HTLC outpoint' });
@@ -856,6 +972,14 @@ app.post('/api/offers/:id/update', async (req: Request, res: Response) => {
             if (typeof fundingTxid !== 'string' || !/^[0-9a-f]{64}$/i.test(fundingTxid)) {
                 return res.status(400).json({ error: 'Invalid HTLC funding transaction id' });
             }
+            // The funding transaction must already be confirmed on its chain.
+            if (await getTxConfirmations(fundingTxid, fundingChain, NETWORK_MODE) < 1) {
+                return res.status(400).json({ error: 'HTLC funding transaction is not confirmed' });
+            }
+            if (typeof offer.numsTweak !== 'string' || !/^[0-9a-f]{64}$/.test(offer.numsTweak)) {
+                return res.status(400).json({ error: 'Offer is missing a valid NUMS tweak and the committed HTLC contract cannot be derived' });
+            }
+            const isFirstHtlc = signer === 'initiator';
             try {
                 const agreedOffset = validateLockTimeOffset(offer.lockTimeOffset);
                 const height = await currentChainHeight(fundingChain);
@@ -889,13 +1013,12 @@ app.post('/api/offers/:id/update', async (req: Request, res: Response) => {
                     ? COORDINATOR_FEES.makerFeePercent
                     : COORDINATOR_FEES.takerFeePercent;
                 const network = NETWORK_MODE === 'mainnet' ? bitcoin.networks.bitcoin : bitcoin.networks.regtest;
-                const isFirstHtlc = signer === 'initiator';
                 const recipient = Buffer.from(isFirstHtlc ? offer.acceptorPubKey! : offer.initiatorPubKey, 'hex');
                 const refund = Buffer.from(isFirstHtlc ? offer.initiatorPubKey : offer.acceptorPubKey!, 'hex');
                 const deadline = submittedDeadline;
                 if (!deadline) return res.status(400).json({ error: 'Offer is missing its committed HTLC deadline' });
                 const expectedAddress = PureBitcoinSwap.createTaprootHtlc(
-                    Buffer.from(offer.initiatorPubKey, 'hex'), Buffer.from(offer.hashLock, 'hex'),
+                    Buffer.from(offer.numsTweak!, 'hex'), Buffer.from(offer.hashLock, 'hex'),
                     recipient, refund, deadline, network
                 ).address;
                 if (fundingAddress !== expectedAddress) {
@@ -928,8 +1051,11 @@ app.post('/api/offers/:id/update', async (req: Request, res: Response) => {
             }
         }
 
-        // 5. Update database fields cleanly
-        await updateOfferFieldsById(id, fields);
+        // 5. Update database fields cleanly, guarded against concurrent status changes (TOCTOU)
+        const changes = await updateOfferFieldsById(id, fields, offer.status);
+        if (changes === 0) {
+            return res.status(409).json({ error: 'Offer status changed concurrently; refresh and retry' });
+        }
         logInfo('offer.updated', {
             requestId: res.locals.requestId,
             id,
@@ -946,7 +1072,7 @@ app.post('/api/offers/:id/update', async (req: Request, res: Response) => {
         });
     } catch (err: any) {
         logError('offer.update_failed', { requestId: res.locals.requestId, id, error: err.message });
-        res.status(500).json({ error: "Database error during verified update: " + err.message });
+        res.status(500).json({ error: "Database error during verified update" });
     }
 });
 
@@ -991,13 +1117,17 @@ app.post('/api/offers/:id/delete', async (req: Request, res: Response) => {
             return res.status(401).json({ error: "Signature verification failed: " + sigErr.message });
         }
 
-        // Signature is valid. Delete from SQLite database
-        await deleteOfferById(id);
+        // Signature is valid. Delete from SQLite database, guarded against
+        // concurrent status changes (TOCTOU): only OPEN/ACCEPTED may be deleted.
+        const deleted = await deleteOfferById(id);
+        if (deleted === 0) {
+            return res.status(409).json({ error: 'Offer status changed concurrently; refresh and retry' });
+        }
         logInfo('offer.deleted', { requestId: res.locals.requestId, id });
         res.json({ success: true, message: `Offer #${id} deleted successfully.` });
     } catch (err: any) {
         logError('offer.delete_failed', { requestId: res.locals.requestId, id, error: err.message });
-        res.status(500).json({ error: "Database error during deletion: " + err.message });
+        res.status(500).json({ error: "Database error during deletion" });
     }
 });
 
@@ -1050,7 +1180,7 @@ app.post('/api/offers/:id/walkback', async (req: Request, res: Response) => {
         });
     } catch (err: any) {
         logError('offer.walkback_failed', { requestId: res.locals.requestId, id, error: err.message });
-        res.status(500).json({ error: "Database error during walkback: " + err.message });
+        res.status(500).json({ error: "Database error during walkback" });
     }
 });
 
@@ -1069,6 +1199,11 @@ app.get('/api/tx/raw', async (req: Request, res: Response) => {
     }
 });
 
+// Tracks addr(address) descriptors already imported into each regtest watch-only
+// wallet so polling does not re-trigger a full rescan on every request.
+const importedDescriptors: Record<ExplorerChain, Set<string>> = { main: new Set(), bip110: new Set() };
+const MAX_IMPORTED_DESCRIPTORS = 10000;
+
 // 5. Wallet Balance and UTXOs tracking (supports Mempool.space for Mainnet, and custom nodes for BIP110)
 app.post('/api/wallet/utxos', async (req: Request, res: Response) => {
     const { address, chain } = req.body; 
@@ -1078,12 +1213,32 @@ app.post('/api/wallet/utxos', async (req: Request, res: Response) => {
     if (chain !== 'main' && chain !== 'bip110') {
         return res.status(400).json({ error: "Invalid chain. Must be 'main' or 'bip110'" });
     }
+    try {
+        bitcoin.address.toOutputScript(address, NETWORK_MODE === 'mainnet' ? bitcoin.networks.bitcoin : bitcoin.networks.regtest);
+    } catch {
+        return res.status(400).json({ error: 'Invalid address' });
+    }
     const mode = NETWORK_MODE;
 
     if (mode === 'mainnet') {
         try {
-            const utxos = await cachedProductionRead(chain, 'address-utxos', { address }, EXPLORER_CACHE_TTL.utxos, () => getProductionUtxos(chain, address));
-            return res.json({ address, chain, utxos });
+            let staleFallback: unknown;
+            const utxos = await cachedProductionRead(
+                chain,
+                'address-utxos',
+                { address },
+                EXPLORER_CACHE_TTL.utxos,
+                () => getProductionUtxos(chain, address),
+                true,
+                error => { staleFallback = error; }
+            );
+            return res.json({
+                address,
+                chain,
+                utxos,
+                stale: staleFallback !== undefined,
+                rateLimited: staleFallback instanceof ExplorerRequestError && staleFallback.status === 429
+            });
         } catch (err: any) {
             return sendExplorerError(res, err, `${chain} UTXO lookup`);
         }
@@ -1093,27 +1248,36 @@ app.post('/api/wallet/utxos', async (req: Request, res: Response) => {
     const watchRpc = chain === 'main' ? mainWatchRpc : bip110WatchRpc;
 
     try {
-        // Import watch-only descriptor using the proper non-private key wallet
-        try {
-            const info = await watchRpc.call('getdescriptorinfo', [`addr(${address})`]);
-            await watchRpc.call('importdescriptors', [[{
-                desc: info.descriptor,
-                timestamp: 0,
-                internal: false,
-                label: 'split-contract'
-            }]]);
-        } catch (err: any) {
-            // Concurrent frontend scans commonly collide with an active descriptor
-            // rescan. It is harmless because listunspent still runs immediately after.
-            const expectedContention = err.message.includes('currently rescanning')
-                || err.message.includes('already exists');
-            if (!expectedContention) {
-                logWarn('wallet.descriptor_import_skipped', {
-                    requestId: res.locals.requestId,
-                    chain,
-                    error: err.message
-                });
+        // Import watch-only descriptor using the proper non-private key wallet,
+        // but only the first time we see this address on this chain.
+        const descriptorKey = `addr(${address})`;
+        const imported = importedDescriptors[chain as ExplorerChain];
+        if (!imported.has(descriptorKey)) {
+            if (imported.size >= MAX_IMPORTED_DESCRIPTORS) {
+                return res.status(503).json({ error: 'Watch-only wallet descriptor capacity exhausted; no further addresses can be tracked' });
             }
+            try {
+                const info = await watchRpc.call('getdescriptorinfo', [descriptorKey]);
+                await watchRpc.call('importdescriptors', [[{
+                    desc: info.descriptor,
+                    timestamp: 0,
+                    internal: false,
+                    label: 'split-contract'
+                }]]);
+            } catch (err: any) {
+                // Concurrent frontend scans commonly collide with an active descriptor
+                // rescan. It is harmless because listunspent still runs immediately after.
+                const expectedContention = err.message.includes('currently rescanning')
+                    || err.message.includes('already exists');
+                if (!expectedContention) {
+                    logWarn('wallet.descriptor_import_skipped', {
+                        requestId: res.locals.requestId,
+                        chain,
+                        error: err.message
+                    });
+                }
+            }
+            imported.add(descriptorKey);
         }
 
         // Query listunspent from our watchonly wallet
@@ -1128,11 +1292,16 @@ app.post('/api/wallet/utxos', async (req: Request, res: Response) => {
         res.json({ address, chain, utxos });
     } catch (err: any) {
         logError('wallet.utxo_lookup_failed', { requestId: res.locals.requestId, chain, error: err.message });
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Wallet UTXO lookup failed' });
     }
 });
 
 // 6. Regtest Faucet / Deposit Simulator
+const FAUCET_MAX_SATS_PER_REQUEST = 100_000_000; // 1 tBTC
+const FAUCET_MAX_SATS_PER_IP_PER_DAY = 500_000_000;
+const FAUCET_WINDOW_MS = 24 * 60 * 60 * 1000;
+const faucetDailyDb: Record<string, { count: number; resetTime: number }> = {};
+
 app.post('/api/regtest/faucet', async (req: Request, res: Response) => {
     if (NETWORK_MODE !== 'regtest') {
         return res.status(403).json({ error: "Regtest endpoints are disabled in Production Mainnet mode." });
@@ -1144,10 +1313,25 @@ app.post('/api/regtest/faucet', async (req: Request, res: Response) => {
     if (chain !== 'main' && chain !== 'bip110') {
         return res.status(400).json({ error: "Invalid chain. Must be 'main' or 'bip110'" });
     }
+    const sats = Number(amountSats);
+    if (!Number.isSafeInteger(sats) || sats <= 0 || sats > FAUCET_MAX_SATS_PER_REQUEST) {
+        return res.status(400).json({ error: `amountSats must be a positive integer up to ${FAUCET_MAX_SATS_PER_REQUEST} (1 tBTC)` });
+    }
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    const quota = faucetDailyDb[ip];
+    if (!quota || now > quota.resetTime) {
+        faucetDailyDb[ip] = { count: sats, resetTime: now + FAUCET_WINDOW_MS };
+    } else {
+        if (quota.count + sats > FAUCET_MAX_SATS_PER_IP_PER_DAY) {
+            return res.status(429).json({ error: 'Daily faucet limit exceeded for this IP' });
+        }
+        quota.count += sats;
+    }
 
     // Spend from the private key enabled Miner wallet
     const minerRpc = chain === 'main' ? mainMinerRpc : bip110MinerRpc;
-    const amountBtc = Number(amountSats) / 100000000;
+    const amountBtc = sats / 100000000;
 
     try {
         const txid = await minerRpc.call('sendtoaddress', [address, amountBtc]);
@@ -1156,16 +1340,21 @@ app.post('/api/regtest/faucet', async (req: Request, res: Response) => {
         await mineRegtestChain(chain, 1);
         await new Promise(resolve => setTimeout(resolve, 500));
 
-        logInfo('regtest.faucet', { requestId: res.locals.requestId, chain, amountSats: Number(amountSats), txid });
+        logInfo('regtest.faucet', { requestId: res.locals.requestId, chain, amountSats: sats, txid });
 
         res.json({ txid, success: true, message: `Deposited ${amountBtc} BTC to ${address} and mined 1 block.` });
     } catch (err: any) {
         logError('regtest.faucet_failed', { requestId: res.locals.requestId, chain, error: err.message });
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Faucet request failed' });
     }
 });
 
 // 7. Regtest Block Miner
+const MINE_MAX_BLOCKS_PER_CALL = 500;
+const MINE_MAX_BLOCKS_PER_IP = 5000;
+const MINE_WINDOW_MS = 10 * 60 * 1000;
+const miningBudgetDb: Record<string, { count: number; resetTime: number }> = {};
+
 app.post('/api/regtest/mine', async (req: Request, res: Response) => {
     if (NETWORK_MODE !== 'regtest') {
         return res.status(403).json({ error: "Regtest endpoints are disabled in Production Mainnet mode." });
@@ -1175,8 +1364,19 @@ app.post('/api/regtest/mine', async (req: Request, res: Response) => {
         return res.status(400).json({ error: "Invalid chain. Must be 'main' or 'bip110'" });
     }
     const numBlocks = Number(blocks ?? 1);
-    if (!Number.isSafeInteger(numBlocks) || numBlocks < 1 || numBlocks > 10_000) {
-        return res.status(400).json({ error: 'blocks must be an integer between 1 and 10000' });
+    if (!Number.isSafeInteger(numBlocks) || numBlocks < 1 || numBlocks > MINE_MAX_BLOCKS_PER_CALL) {
+        return res.status(400).json({ error: `blocks must be an integer between 1 and ${MINE_MAX_BLOCKS_PER_CALL}` });
+    }
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    const budget = miningBudgetDb[ip];
+    if (!budget || now > budget.resetTime) {
+        miningBudgetDb[ip] = { count: numBlocks, resetTime: now + MINE_WINDOW_MS };
+    } else {
+        if (budget.count + numBlocks > MINE_MAX_BLOCKS_PER_IP) {
+            return res.status(429).json({ error: `Mining budget exceeded: at most ${MINE_MAX_BLOCKS_PER_IP} blocks per IP per 10 minutes` });
+        }
+        budget.count += numBlocks;
     }
 
     try {
@@ -1195,7 +1395,7 @@ app.post('/api/regtest/mine', async (req: Request, res: Response) => {
         res.json({ success: true, hashes, coreHashes, bip110Hashes });
     } catch (err: any) {
         logError('regtest.mining_failed', { requestId: res.locals.requestId, chain, error: err.message });
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Mining request failed' });
     }
 });
 
@@ -1243,6 +1443,44 @@ app.post('/api/tx/broadcast', async (req: Request, res: Response) => {
     }
 });
 
+// Purpose-built relay for users whose wallet only reached the Bitcoin side of the fork.
+// This endpoint accepts a signed raw transaction only; it never accepts keys or signs data.
+app.post('/api/tx/bip110/submit', async (req: Request, res: Response) => {
+    let parsed;
+    try {
+        parsed = parseRawTransactionHex(req.body?.hex);
+    } catch (err: any) {
+        return res.status(400).json({ error: err.message });
+    }
+
+    try {
+        const rpc = NETWORK_MODE === 'mainnet' ? getProductionRpc('bip110') : bip110MinerRpc;
+        const txid = rpc
+            ? await rpc.call('sendrawtransaction', [parsed.hex])
+            : await getMainnetExplorer('bip110').broadcastTransaction(parsed.hex);
+
+        logInfo('transaction.bip110_relay', {
+            requestId: res.locals.requestId,
+            networkMode: NETWORK_MODE,
+            txid,
+            byteLength: parsed.byteLength,
+            virtualSize: parsed.virtualSize
+        });
+        return res.json({ success: true, txid, transaction: parsed });
+    } catch (err: any) {
+        logWarn('transaction.bip110_relay_rejected', {
+            requestId: res.locals.requestId,
+            networkMode: NETWORK_MODE,
+            txid: parsed.txid,
+            error: err.message
+        });
+        if (NETWORK_MODE === 'mainnet' && !getProductionRpc('bip110')) {
+            return sendExplorerError(res, err, 'BIP110 transaction relay');
+        }
+        return res.status(400).json({ error: err.message, txid: parsed.txid });
+    }
+});
+
 // 9. Node Chain Height Info (Supports both Mainnet and Regtest for real-time safety monitoring)
 app.get('/api/node/info', async (req: Request, res: Response) => {
     if (NETWORK_MODE === 'mainnet') {
@@ -1264,19 +1502,10 @@ app.get('/api/node/info', async (req: Request, res: Response) => {
             : undefined;
         if (mainError) logWarn('chain_tip.unavailable', { requestId: res.locals.requestId, chain: 'main', error: mainError });
         if (bip110Error) logWarn('chain_tip.unavailable', { requestId: res.locals.requestId, chain: 'bip110', error: bip110Error });
-        let bip110Activation = unavailableActivation();
-        const bip110Rpc = getProductionRpc('bip110');
-        if (bip110Rpc) {
-            try {
-                bip110Activation = activationFromBlockchainInfo(await bip110Rpc.call('getblockchaininfo'));
-            } catch (error: any) {
-                logWarn('bip110.activation_unavailable', { requestId: res.locals.requestId, error: error.message });
-            }
-        } else if (bip110Result.status === 'fulfilled') {
-            // Esplora does not expose versionbits state. The BIP guarantees activation
-            // no later than this height, so stay locked until that conservative bound.
-            bip110Activation = mainnetHeightFallback(bip110Result.value);
-        }
+        // Production readiness follows the BLAKE2b fork activation height.
+        const bip110Activation = bip110Result.status === 'fulfilled'
+            ? mainnetActivationFromHeight(bip110Result.value)
+            : unavailableActivation();
         return res.json({
             mainHeight: mainResult.status === 'fulfilled' ? mainResult.value : 0,
             bip110Height: bip110Result.status === 'fulfilled' ? bip110Result.value : 0,
@@ -1290,15 +1519,15 @@ app.get('/api/node/info', async (req: Request, res: Response) => {
 
     // Regtest Mode
     try {
-        const [mainHeight, bip110Height, blockchainInfo] = await Promise.all([
+        const [mainHeight, bip110Height, deploymentInfo] = await Promise.all([
             mainMinerRpc.call('getblockcount'),
             bip110MinerRpc.call('getblockcount'),
-            bip110MinerRpc.call('getblockchaininfo')
+            bip110MinerRpc.call('getdeploymentinfo')
         ]);
         res.json({
             mainHeight,
             bip110Height,
-            bip110Activation: activationFromBlockchainInfo(blockchainInfo)
+            bip110Activation: activationFromBlockchainInfo(deploymentInfo)
         });
     } catch (err: any) {
         logError('node.info_failed', { requestId: res.locals.requestId, error: err.message });
@@ -1306,7 +1535,7 @@ app.get('/api/node/info', async (req: Request, res: Response) => {
             mainHeight: 0,
             bip110Height: 0,
             bip110Activation: unavailableActivation(),
-            error: err.message
+            error: 'Chain height lookup failed'
         });
     }
 });
@@ -1341,6 +1570,23 @@ app.get('/api/fees/recommended', async (req: Request, res: Response) => {
     } catch (err: any) {
         return sendExplorerError(res, err, `${chain} fee estimate`);
     }
+});
+
+// Terminal error handler: stack traces and internal details are logged
+// server-side only; clients receive a generic message with the request id.
+app.use((err: any, req: Request, res: Response, _next: any) => {
+    const requestId = res.locals.requestId || randomUUID();
+    if (err instanceof SyntaxError && (err as any).status === 400 && 'body' in err) {
+        return res.status(400).json({ error: 'Malformed JSON body', requestId });
+    }
+    logError('http.unhandled_error', {
+        requestId,
+        method: req.method,
+        path: req.path,
+        error: err instanceof Error ? err.stack || err.message : String(err)
+    });
+    if (res.headersSent) return;
+    res.status(500).json({ error: 'Internal server error', requestId });
 });
 
 async function startServer() {

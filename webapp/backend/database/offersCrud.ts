@@ -26,6 +26,9 @@ export interface DbOffer {
     backingVout?: number | null;
     backingChain?: 'main' | 'bip110' | null;
     acceptorClaimed?: number; // 0 or 1
+    numsTweak?: string | null;
+    acceptorFundingTxid?: string | null;
+    acceptorFundingVout?: number | null;
 }
 
 export interface GetOffersOptions {
@@ -51,7 +54,7 @@ export async function getOffersByMode(
     options: GetOffersOptions = {}
 ): Promise<PaginatedOffers> {
     const page = options.page && options.page > 0 ? Number(options.page) : 1;
-    const limit = options.limit && options.limit > 0 ? Number(options.limit) : 10;
+    const limit = Math.min(options.limit && options.limit > 0 ? Number(options.limit) : 10, 100);
     const offset = (page - 1) * limit;
 
     const allowedOrderBy = ['premium', 'amount', 'createdAt'];
@@ -121,6 +124,7 @@ export async function insertOffer(offer: {
     hashLock: string;
     lockTimeOffset: number;
     networkMode: 'mainnet' | 'regtest';
+    numsTweak: string;
     backingTxid?: string | null;
     backingVout?: number | null;
     backingChain?: 'main' | 'bip110' | null;
@@ -130,25 +134,30 @@ export async function insertOffer(offer: {
         INSERT INTO offers (
             id, status, initiatorPubKey, initiatorB110Amount, acceptorPubKey, acceptorBtcAmount,
             hashLock, lockTime, secondLockTime, lockTimeOffset, b110HtlcAddress, btcHtlcAddress, b110HtlcTxid, btcHtlcTxid, b110HtlcVout, btcHtlcVout,
-            initiatorSettlementTxid, acceptorSettlementTxid, preimage, networkMode, createdAt, backingTxid, backingVout, backingChain, acceptorClaimed
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            initiatorSettlementTxid, acceptorSettlementTxid, preimage, networkMode, createdAt, backingTxid, backingVout, backingChain, acceptorClaimed, numsTweak
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
     `, [
         offer.id, 'OPEN', offer.initiatorPubKey, offer.initiatorB110Amount, null, offer.acceptorBtcAmount,
         offer.hashLock, 0, null, offer.lockTimeOffset, null, null, null, null, null, null,
         null, null, null, offer.networkMode, createdAt, offer.backingTxid || null,
-        offer.backingVout !== undefined ? offer.backingVout : null, offer.backingChain || null
+        offer.backingVout !== undefined ? offer.backingVout : null, offer.backingChain || null, offer.numsTweak
     ]);
 }
 
-export async function acceptOfferById(id: string, acceptorPubKey: string): Promise<boolean> {
+export async function acceptOfferById(
+    id: string,
+    acceptorPubKey: string,
+    acceptorFundingTxid: string,
+    acceptorFundingVout: number
+): Promise<boolean> {
     const result = await dbRun(
-        "UPDATE offers SET acceptorPubKey = ?, status = 'ACCEPTED' WHERE id = ? AND status = 'OPEN'",
-        [acceptorPubKey, id]
+        "UPDATE offers SET acceptorPubKey = ?, acceptorFundingTxid = ?, acceptorFundingVout = ?, status = 'ACCEPTED' WHERE id = ? AND status = 'OPEN'",
+        [acceptorPubKey, acceptorFundingTxid, acceptorFundingVout, id]
     );
     return result.changes === 1;
 }
 
-export async function updateOfferFieldsById(id: string, fields: Partial<DbOffer>): Promise<void> {
+export async function updateOfferFieldsById(id: string, fields: Partial<DbOffer>, expectedStatus: DbOffer['status']): Promise<number> {
     const updates: string[] = [];
     const params: any[] = [];
 
@@ -169,22 +178,23 @@ export async function updateOfferFieldsById(id: string, fields: Partial<DbOffer>
         }
     }
 
-    if (updates.length > 0) {
-        params.push(id);
-        await dbRun(
-            `UPDATE offers SET ${updates.join(', ')} WHERE id = ?`,
-            params
-        );
-    }
+    if (updates.length === 0) return 0;
+    params.push(id, expectedStatus);
+    const result = await dbRun(
+        `UPDATE offers SET ${updates.join(', ')} WHERE id = ? AND status = ?`,
+        params
+    );
+    return result.changes;
 }
 
-export async function deleteOfferById(id: string): Promise<void> {
-    await dbRun("DELETE FROM offers WHERE id = ?", [id]);
+export async function deleteOfferById(id: string): Promise<number> {
+    const result = await dbRun("DELETE FROM offers WHERE id = ? AND status IN ('OPEN', 'ACCEPTED')", [id]);
+    return result.changes;
 }
 
 export async function walkbackAcceptanceById(id: string): Promise<void> {
     await dbRun(
-        "UPDATE offers SET status = 'OPEN', acceptorPubKey = NULL WHERE id = ?",
+        "UPDATE offers SET status = 'OPEN', acceptorPubKey = NULL, acceptorFundingTxid = NULL, acceptorFundingVout = NULL WHERE id = ?",
         [id]
     );
 }

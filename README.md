@@ -1,41 +1,24 @@
-# Double-Sided Replay-Protected Atomic Swap MainChain/BIP110-Chain
+# Replay-Protected Atomic Swap Between Bitcoin and the BLAKE2b Fork
 
-A double-sided, replay-protected atomic swap protocol designed to operate safely across a hard fork using pure, hyper-optimized Taproot MAST script leaves. This implementation is based on the [Double-Sided Replay-Protected Atomic Swap across BIP110 Hard Fork Gist](https://gist.github.com/a1denvalu3/7641b514bdb3b9de1b0f87a96c19cbf4), which formalizes the exact cryptographic splitting and swap scheme implemented here. It strictly avoids conditional branching opcodes in its HTLC script leaves to fully comply with the BIP110 opcode ban, providing a robust, lightweight, and framework-free atomic swap engine using raw `bitcoinjs-lib` and `tiny-secp256k1`.
+A replay-protected atomic swap protocol for Bitcoin and the BLAKE2b proof-of-work fork. Coin separation uses the fork's native `SIGHASH_UNIFIED` signing mode from [Bitcoin Knots PR #357](https://github.com/bitcoinknots/bitcoin/pull/357). HTLCs remain compact Taproot MAST contracts implemented with `bitcoinjs-lib` and `tiny-secp256k1`.
 
 ---
 
 ## Technical Overview
 
-During a hard fork, transaction replay attacks pose a critical risk to users trading across the split networks. BIP110 introduces a hard-fork consensus rule that bans conditional branching opcodes (`OP_IF`, `OP_ELSE`, `OP_ENDIF`) inside Taproot script leaves. 
+The original BIP110 activation did not acquire enough proof of work. The fork subsequently changed its mining algorithm to BLAKE2b and introduced `SIGHASH_UNIFIED`, an opt-in signature digest domain that legacy Bitcoin does not recognize.
 
 To overcome this restriction while ensuring cross-chain atomic swaps remain completely secure and replay-protected, this protocol utilizes two key design paradigms:
-1. **Pure Multi-Contract MAST Leaves**: HTLC conditional logic is entirely flattened into modular, independent leaves inside a Taproot MAST tree (no `OP_IF` allowed).
-2. **Bilateral Double-Sided Coin Splitting**: Prior to funding any cross-chain HTLC, both the **Initiator** and **Acceptor** split their UTXOs on each respective chain. One spend uses the `OP_IF` scriptpath (accepted on Main-Chain, rejected on BIP110-Chain) and the other uses a Schnorr Keypath spend (accepted on both, but because the input is spent via `OP_IF` on the Main-Chain, it remains unique to the BIP110-Chain).
+1. **Native coin separation**: A Taproot key-path spend signed with `SIGHASH_ALL|SIGHASH_UNIFIED` (`0x21`) confirms on the BLAKE2b chain and is invalid on Bitcoin. The original outpoint remains available on Bitcoin.
+2. **Pure Multi-Contract MAST Leaves**: HTLC claim and refund logic stays flattened into independent Taproot leaves.
 
 ---
 
-## The Bilateral Coin Split & HTLC Funding Symmetry
+## Native Coin Split
 
-The protocol establishes a perfect, mirror-image cryptographic locking mechanism between the two participants to ensure zero replay risk:
+For an outpoint shared by both chains, the wallet constructs one BLAKE2b-chain transaction and signs its Taproot key path over the unified digest. Its Schnorr signature is 65 bytes and ends in `0x21`. A Bitcoin node rejects the undefined Taproot hash type, while an activated BLAKE2b node verifies the fork-specific digest. After confirmation, the new output exists only on BLAKE2b and the original output exists only on Bitcoin.
 
-| Participant | Chain they are Selling on | Spend Path used to Split & Fund | HTLC Location | Chain they are Buying on | How they Claim |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Initiator ($\mathcal{I}$)** | **BIP110-Chain** | **Keypath (Schnorr)** | BIP110-Chain | **Main-Chain** | Revealed Preimage $s$ |
-| **Acceptor ($\mathcal{A}$)** | **Main-Chain** | **Scriptpath (`OP_IF`)** | Main-Chain | **BIP110-Chain** | Extracted Preimage $s$ |
-
-### Why this is Cryptographically and Economically Elegant:
-
-1. **The Initiator ($\mathcal{I}$)**:
-   * Wants to get rid of their BIP110-Chain coins in exchange for Main-Chain coins.
-   * On the **BIP110-Chain**, the Initiator uses their **Keypath spend** to split their coins.
-   * They then use this split UTXO to fund the **BIP110-Chain HTLC**.
-   * Since the parent UTXO on the Main-Chain was already spent via the `OP_IF` scriptpath, this transaction is a double-spend and impossible to replay on the Main-Chain.
-
-2. **The Acceptor ($\mathcal{A}$)**:
-   * Wants to get rid of their Main-Chain coins in exchange for BIP110-Chain coins.
-   * On the **Main-Chain**, the Acceptor uses their **`OP_IF` scriptpath spend** to split their coins.
-   * They then use this split UTXO to fund the **Main-Chain HTLC**.
-   * Since this split transaction's ancestry contains the banned `OP_IF` opcode, it is rejected instantly by Knots nodes, making it impossible to replay on the BIP110-Chain.
+The deposit output includes a one-byte inert `OP_RETURN` leaf solely so deposit addresses remain distinct from ordinary wallet/change addresses. That leaf is never revealed and provides no replay protection.
 
 ---
 
@@ -43,9 +26,10 @@ The protocol establishes a perfect, mirror-image cryptographic locking mechanism
 
 By eliminating sCrypt boilerplate and hand-crafting script elements, we achieve extremely compact, fee-efficient bytecode sizes:
 
-### 1. Split Contract
-* **OPCODE Structure**: `OP_IF OP_RETURN OP_ELSE <pubKey> OP_CHECKSIG OP_ENDIF`
-* **Bytecode Size**: **38 bytes**
+### 1. Split Deposit Leaf
+* **OPCODE Structure**: `OP_RETURN`
+* **Bytecode Size**: **1 byte**
+* **Spend path**: Taproot key path with `SIGHASH_ALL|SIGHASH_UNIFIED`
 
 ### 2. HTLC Claim Leaf
 * **OPCODE Structure**: `OP_SHA256 <hashLock> OP_EQUALVERIFY <recipientPubKey> OP_CHECKSIG`
@@ -59,7 +43,7 @@ By eliminating sCrypt boilerplate and hand-crafting script elements, we achieve 
 
 ## Integration Tests & Verification
 
-The integration suite runs against connected, native Bitcoin Core (v26.0) and Bitcoin Knots (v29.3 with BIP110 consensus enabled) containers on a local Regtest network. This setup represents a high-fidelity, real-time simulation of an active hard fork split.
+The integration suite runs against Bitcoin Core v26.0 and BLAKE2b-enabled Bitcoin Knots 29.4.1 rc4. Regtest activates the `blake2b` buried deployment at block 112, after 110 shared maturity blocks and one shared funding block.
 
 ### Prerequisites
 Make sure Docker is running on your host machine.
@@ -73,13 +57,13 @@ Make sure Docker is running on your host machine.
    ```bash
    docker-compose up -d
    ```
-   * **BIP110 Activation:** The Bitcoin Knots container automatically activates the BIP110 `reduced_data` consensus rules immediately on startup via the version bit parameter `-vbparams=reduced_data:-1:999999999999`.
+   * **BLAKE2b Activation:** Compose schedules `-testactivationheight=blake2b@112` on the Knots regtest node.
    * **Dual-Node P2P Connection:** The Core and Knots nodes are automatically connected to each other over P2P at startup via an automated `addnode` initialization sequence. This establishes a fully connected block propagation topology prior to the hard fork split.
 
 ### Running Verification Tests
 
 #### 1. Coin Split Primitive Test
-Asserts that `OP_IF` scriptpath transactions executed on Bitcoin Core are correctly rejected by Bitcoin Knots (BIP110-Chain) and that Schnorr keypath spends work correctly for both parties:
+Asserts that Knots accepts a `SIGHASH_UNIFIED` Taproot key-path transaction, Bitcoin rejects its `0x21` hash type, and the shared outpoint separates correctly:
 ```bash
 npm run test:split
 ```
@@ -121,11 +105,17 @@ http://localhost:3000
 ```
 
 * **Step-by-Step Simulation Guide**:
-  1. **Tab 1: Unified Wallet & Coin Faucet**: Generate mature coinbase miner rewards and activate the BIP110 consensus split natively by clicking **"Mine 450 blocks"**. Next, deposit test coins to your derived P2TR split contract address using the **Core and Knots faucets**.
-  2. **Tab 2: Bilateral Splitter**: Select your deposited unsplit UTXO. Download your master seed recovery backup file to unlock features, then click **"Split Coins (Scriptpath Spend)"** to execute a split transaction (accepted on Bitcoin Core but rejected on Knots, cleanly isolating your BIP110 coins).
+  1. **Tab 1: Unified Wallet & Coin Faucet**: Mine 110 shared blocks, use the Bitcoin faucet once so the deposit confirms in shared block 111, then mine one BLAKE2b block to activate the fork at 112. Do not create two independent faucet transactions: an unsplit coin must be the same `txid:vout` on both chains.
+  2. **Tab 2: Bilateral Splitter**: Select your deposited unsplit UTXO, download your recovery backup, then click **"Split Coins (SIGHASH_UNIFIED)"**. The transaction is broadcast only to the BLAKE2b chain and cannot replay on Bitcoin.
   3. **Tab 3: Marketplace Lobby**: Publish a swap offer to sell your isolated BIP110 coins in exchange for Mainnet BTC, customized with custom premiums or discounts.
   4. **Tab 4: My Swaps & Offers**: Monitor your listings, delete outstanding listings, walk back acceptances, or accept your own listing as a counterparty (by generating a new active P2TR address in Tab 1!).
   5. **Tab 5: Swap Wizard**: Orchestrate the end-to-end atomic swap using the step-by-step visual workflow to fund escrows, extract revealed preimages, settle claims, or simulate expired refund scripts.
+
+### Relaying a Wallet Transaction to BIP110
+
+After the networks have separated, a wallet may broadcast a transaction only to Bitcoin even though the same pre-split inputs remain spendable on BIP110. In **Unified Wallet**, expand **Relay a Transaction to BIP110**, copy the signed raw transaction hex from the wallet, review the locally decoded transaction ID and size, and submit it. The backend relays it only to the BIP110 chain: through the Knots RPC node in regtest, or the configured BIP110 RPC/Esplora source in mainnet mode.
+
+The relay accepts canonical serialized transaction hex, not a PSBT, private key, seed phrase, or wallet file. The BIP110 node still performs all normal consensus and mempool-policy validation.
 
 ## Production Mainnet Chain Data Configuration
 
@@ -159,7 +149,7 @@ npm run server:mainnet
 RPC mode creates and persists a disabled-private-keys wallet named `watchonly`. Addresses are imported when the frontend first scans them, so the backend must see an address before it receives funds. Preserve the node wallet directory across restarts. Raw transaction lookup on a pruned node only works while the relevant block remains available; transactions cached by Redis remain available to the backend for the configured cache lifetime.
 
 Explorer mode requires chain height, transaction status, address UTXOs, and raw transaction broadcast. Recommended fees may be supplied by either Mempool's `/api/v1/fees/recommended` endpoint or Esplora's `/api/fee-estimates` endpoint.
-Reads from either source are shared through Redis so repeated requests from different clients do not repeatedly hit the upstream. `npm run server:mainnet` starts the bundled Redis service automatically.
+Reads from either source are shared through Redis and a bounded process-local cache, so repeated per-address UTXO requests do not repeatedly hit the upstream. The wallet endpoint retains expired values briefly as display-only stale fallbacks when an explorer is unavailable or rate-limited; transaction-safety checks still fail closed. `npm run server:mainnet` starts the bundled Redis service automatically.
 
 ```bash
 BITCOIN_EXPLORER_URL=https://mempool.space \
@@ -167,10 +157,17 @@ BIP110_EXPLORER_URL=https://your-bip110-mempool.example \
 npm run server:mainnet
 ```
 
+Multiple Bitcoin explorers can be configured as a comma-separated pool. The current request is retried against the next endpoint whenever an explorer returns HTTP 429, and that endpoint remains active until a later 429 rotates the pool again. `BITCOIN_EXPLORER_URL` remains the single-endpoint fallback.
+
+```bash
+BITCOIN_EXPLORER_URLS=https://mempool.space,https://another-esplora.example \
+npm run server:mainnet
+```
+
 Use `REDIS_URL` to point at an external Redis instance. Cache lifetimes can be tuned with
 `EXPLORER_TIP_CACHE_SECONDS`, `EXPLORER_UTXO_CACHE_SECONDS`,
 `EXPLORER_CONFIRMATION_CACHE_SECONDS`, `EXPLORER_RAW_TX_CACHE_SECONDS`, and
-`EXPLORER_FEE_CACHE_SECONDS`. Defaults are 10, 15, 15, 86400, and 30 seconds respectively.
+`EXPLORER_FEE_CACHE_SECONDS`. Defaults are 20, 60, 60, 86400, and 60 seconds respectively.
 
 Coordinator fees are disabled by default. To require funding transactions from makers (initiators)
 and takers (acceptors) to pay the coordinator, configure percentage values and a receive address:

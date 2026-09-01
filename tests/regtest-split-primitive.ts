@@ -1,39 +1,28 @@
 import { PureBitcoinSwap } from '../src/lib/PureBitcoinSwap';
+import { SIGHASH_ALL_UNIFIED } from '../src/lib/unifiedSighash';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from 'tiny-secp256k1';
 import axios from 'axios';
 
-// Initialize ECPair API
 bitcoin.initEccLib(ecc);
-
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 class BitcoinRpc {
-    private url: string;
-    private walletUrl: string;
+    private readonly url: string;
+    private readonly walletUrl: string;
     constructor(port: number) {
         this.url = `http://user:password@127.0.0.1:${port}/`;
         this.walletUrl = `http://user:password@127.0.0.1:${port}/wallet/miner`;
     }
-
     async call(method: string, params: any[] = []): Promise<any> {
-        const walletMethods = ['getnewaddress', 'sendtoaddress', 'listunspent', 'getbalance'];
-        const targetUrl = walletMethods.includes(method) ? this.walletUrl : this.url;
+        const walletMethods = new Set(['getnewaddress', 'sendtoaddress', 'listunspent', 'getbalance']);
         try {
-            const response = await axios.post(targetUrl, {
-                jsonrpc: '1.0',
-                id: 'regtest',
-                method,
-                params
-            }, {
-                headers: { 'Content-Type': 'application/json' }
+            const response = await axios.post(walletMethods.has(method) ? this.walletUrl : this.url, {
+                jsonrpc: '1.0', id: 'regtest', method, params
             });
             return response.data.result;
-        } catch (err: any) {
-            if (err.response && err.response.data && err.response.data.error) {
-                throw new Error(`RPC Error [${method}]: ${err.response.data.error.message}`);
-            }
-            throw new Error(`RPC Error [${method}]: ${err.message}`);
+        } catch (error: any) {
+            throw new Error(`RPC Error [${method}]: ${error.response?.data?.error?.message || error.message}`);
         }
     }
 }
@@ -41,242 +30,86 @@ class BitcoinRpc {
 const mainRpc = new BitcoinRpc(18443);
 const bip110Rpc = new BitcoinRpc(18444);
 
-async function setupWallet(rpc: BitcoinRpc) {
-    try {
-        await rpc.call('createwallet', ['miner']);
-        console.log("   - Created new wallet 'miner'");
-    } catch (err: any) {
-        if (err.message.includes('already exists')) {
-            console.log("   - Wallet 'miner' already loaded.");
-        } else {
-            throw err;
-        }
+async function waitForRpc(rpc: BitcoinRpc): Promise<void> {
+    for (let attempt = 0; attempt < 30; attempt++) {
+        try { await rpc.call('getblockcount'); return; }
+        catch { await sleep(500); }
+    }
+    throw new Error('Node RPC did not become ready');
+}
+
+async function setupWallet(rpc: BitcoinRpc): Promise<void> {
+    try { await rpc.call('createwallet', ['miner']); }
+    catch (error: any) {
+        if (!error.message.includes('already exists') && !error.message.includes('already loaded')) throw error;
     }
 }
 
-// Find output index of a given target scriptPubKey hex
-async function findOutputIndex(rpc: BitcoinRpc, txid: string, targetScriptHex: string): Promise<number> {
-    const rawTx = await rpc.call('getrawtransaction', [txid, true]);
-    for (let i = 0; i < rawTx.vout.length; i++) {
-        if (rawTx.vout[i].scriptPubKey.hex === targetScriptHex) {
-            return i;
-        }
+async function waitForHeight(rpc: BitcoinRpc, expected: number): Promise<void> {
+    for (let attempt = 0; attempt < 20; attempt++) {
+        if (await rpc.call('getblockcount') === expected) return;
+        await sleep(500);
     }
-    throw new Error(`Could not find output index for script: ${targetScriptHex}`);
+    throw new Error(`Node did not reach shared height ${expected}`);
 }
 
-async function runSplitPrimitiveTest() {
-    console.log("🚀 Starting BIP110 Split Primitive Regtest Verification...");
+async function findOutputIndex(rpc: BitcoinRpc, txid: string, scriptHex: string): Promise<number> {
+    const transaction = await rpc.call('getrawtransaction', [txid, true]);
+    const index = transaction.vout.findIndex((output: any) => output.scriptPubKey.hex === scriptHex);
+    if (index < 0) throw new Error(`Output ${scriptHex} was not found in ${txid}`);
+    return index;
+}
 
-    // 1. Wallets setup
-    console.log("\n1. Setting up miner wallets...");
+async function run(): Promise<void> {
+    console.log('Starting native SIGHASH_UNIFIED split verification');
+    await Promise.all([waitForRpc(mainRpc), waitForRpc(bip110Rpc)]);
     await setupWallet(mainRpc);
     await setupWallet(bip110Rpc);
+    try { await mainRpc.call('addnode', ['bitcoind-bip110:18444', 'add']); } catch {}
 
-    // 2. Connect via P2P
-    console.log("\n2. Connecting Main-Chain node to BIP110 node...");
+    const sharedMiner = await mainRpc.call('getnewaddress');
+    await mainRpc.call('generatetoaddress', [110, sharedMiner]);
+    await waitForHeight(bip110Rpc, 110);
+
+    const owner = PureBitcoinSwap.generateKeyPair();
+    const split = PureBitcoinSwap.createSplitPayment(Buffer.from(owner.publicKey), bitcoin.networks.regtest);
+    const fundingTxid = await mainRpc.call('sendtoaddress', [split.payment.address, 10]);
+    await mainRpc.call('generatetoaddress', [1, sharedMiner]);
+    await waitForHeight(bip110Rpc, 111);
+
+    const vout = await findOutputIndex(mainRpc, fundingTxid, Buffer.from(split.payment.output!).toString('hex'));
+    const destination = bitcoin.payments.p2tr({
+        internalPubkey: PureBitcoinSwap.getXOnlyPubKey(Buffer.from(owner.publicKey)),
+        network: bitcoin.networks.regtest
+    });
+    const splitTransaction = PureBitcoinSwap.buildUnifiedSplitTx(
+        owner, fundingTxid, vout, 1_000_000_000n, 999_998_000n,
+        destination.address!, split.payment, split.script, bitcoin.networks.regtest
+    );
+
+    const witness = splitTransaction.ins[0].witness;
+    if (witness.length !== 1 || witness[0].length !== 65 || witness[0][64] !== SIGHASH_ALL_UNIFIED) {
+        throw new Error('Split transaction does not carry a canonical SIGHASH_ALL|UNIFIED key-path signature');
+    }
+
+    const splitTxid = await bip110Rpc.call('sendrawtransaction', [splitTransaction.toHex()]);
     try {
-        await mainRpc.call('addnode', ['bitcoind-bip110:18444', 'add']);
-        await sleep(2000);
-    } catch {}
-
-    // 3. Shared ancestry blocks 1-110 (Activates BIP110 consensus rules on Knots from genesis)
-    console.log("\n3. Mining 110 blocks of shared history...");
-    const sharedMinerAddr = await mainRpc.call('getnewaddress');
-    await mainRpc.call('generatetoaddress', [110, sharedMinerAddr]);
-
-    let heightMain = 110;
-    let heightBip110 = 0;
-    for (let i = 0; i < 10; i++) {
-        heightMain = await mainRpc.call('getblockcount');
-        heightBip110 = await bip110Rpc.call('getblockcount');
-        if (heightMain === heightBip110) break;
-        await sleep(1000);
-    }
-    console.log(`   - Main Height: ${heightMain}, BIP110 Height: ${heightBip110}`);
-
-    // 4. Create and Fund Split Output
-    console.log("\n4. Funding the Split outputs for Initiator and Acceptor with 10 BTC each...");
-    const initiator = PureBitcoinSwap.generateKeyPair();
-    const { payment: splitPayment, script: splitScript } = PureBitcoinSwap.createSplitPayment(Buffer.from(initiator.publicKey), bitcoin.networks.regtest);
-    const splitAddress = splitPayment.address!;
-    console.log(`   - Initiator Split Contract Address: ${splitAddress}`);
-
-    const acceptor = PureBitcoinSwap.generateKeyPair();
-    const { payment: accSplitPayment, script: accSplitScript } = PureBitcoinSwap.createSplitPayment(Buffer.from(acceptor.publicKey), bitcoin.networks.regtest);
-    const accSplitAddress = accSplitPayment.address!;
-    console.log(`   - Acceptor Split Contract Address : ${accSplitAddress}`);
-
-    const fundTxid = await mainRpc.call('sendtoaddress', [splitAddress, 10.0]);
-    const accFundTxid = await mainRpc.call('sendtoaddress', [accSplitAddress, 10.0]);
-    await mainRpc.call('generatetoaddress', [1, sharedMinerAddr]);
-    await sleep(1000); // sync
-    console.log(`   - Fund Block Mined. Initiator Fund TxID: ${fundTxid}`);
-    console.log(`   - Fund Block Mined. Acceptor Fund TxID : ${accFundTxid}`);
-
-    // 5. ENFORCING CONSENSUS-LEVEL FORK SPLIT VIA KNOTS -CONSENSUSRULES=RDTS
-    console.log("\n5. ENFORCING CONSENSUS-LEVEL FORK SPLIT VIA KNOTS -CONSENSUSRULES=RDTS");
-    console.log("   - We are running the Knots node with consensusrules=rdts active.");
-    const initialPeers = await mainRpc.call('getpeerinfo');
-    console.log(`   - Initial Peer Count: ${initialPeers.length} (Nodes are connected)`);
-
-    // 6. Main Chain: Execute Scriptpath spends using OP_IF
-    console.log("\n6. Executing OP_IF Scriptpath spends on Main-Chain...");
-    
-    // Initiator Main Chain spend
-    const outputIndex = await findOutputIndex(mainRpc, fundTxid, Buffer.from(splitPayment.output!).toString('hex'));
-    const receiverAddrMain = await mainRpc.call('getnewaddress');
-    const mainSpendTx = PureBitcoinSwap.buildScriptpathSplitTx(
-        initiator, fundTxid, outputIndex, 1000000000n, 999000000n, receiverAddrMain, splitPayment, splitScript, bitcoin.networks.regtest
-    );
-    const rawMainHex = mainSpendTx.toHex();
-    const splitTxidMain = await mainRpc.call('sendrawtransaction', [rawMainHex]);
-    console.log(`   - Initiator split accepted on Main-Chain! TxID: ${splitTxidMain}`);
-
-    // Acceptor Main Chain spend
-    const accOutputIndex = await findOutputIndex(mainRpc, accFundTxid, Buffer.from(accSplitPayment.output!).toString('hex'));
-    const accReceiverAddrMain = await mainRpc.call('getnewaddress');
-    const accMainSpendTx = PureBitcoinSwap.buildScriptpathSplitTx(
-        acceptor, accFundTxid, accOutputIndex, 1000000000n, 999000000n, accReceiverAddrMain, accSplitPayment, accSplitScript, bitcoin.networks.regtest
-    );
-    const rawAccMainHex = accMainSpendTx.toHex();
-    const accSplitTxidMain = await mainRpc.call('sendrawtransaction', [rawAccMainHex]);
-    console.log(`   - Acceptor split accepted on Main-Chain! TxID: ${accSplitTxidMain}`);
-
-    console.log("   - Mining the OP_IF transactions on Main-Chain...");
-    await mainRpc.call('generatetoaddress', [1, sharedMinerAddr]);
-
-    console.log("   - Knots natively rejects the invalid block containing OP_IF (BIP110 consensus enforced).");
-
-    console.log("   - Waiting for state reorganization...");
-    await sleep(2000);
-
-    const finalPeers = await mainRpc.call('getpeerinfo');
-    const heightMainPost = await mainRpc.call('getblockcount');
-    const heightBip110Post = await bip110Rpc.call('getblockcount');
-
-    console.log(`   - Post-Block Peer Count: ${finalPeers.length}`);
-    console.log(`   - Main-Chain Height: ${heightMainPost}`);
-    console.log(`   - BIP110-Chain Height: ${heightBip110Post}`);
-
-    if (heightBip110Post < heightMainPost) {
-        console.log("   - 🎉 SUCCESS! Knots successfully invalidated the OP_IF block and reverted its height!");
-    } else {
-        console.error("   - ❌ FAILURE! Knots did not revert height!");
-        process.exit(1);
+        await mainRpc.call('sendrawtransaction', [splitTransaction.toHex()]);
+        throw new Error('Bitcoin Core accepted a SIGHASH_UNIFIED transaction');
+    } catch (error: any) {
+        if (error.message === 'Bitcoin Core accepted a SIGHASH_UNIFIED transaction') throw error;
+        console.log(`Bitcoin correctly rejected the unified signature: ${error.message}`);
     }
 
-    // Validate UTXOs on Core (Main-Chain) after split is mined on Core
-    console.log("\n6b. Verifying UTXO state on Main-Chain...");
-    const parentUtxoMain = await mainRpc.call('gettxout', [fundTxid, outputIndex]);
-    const parentAccUtxoMain = await mainRpc.call('gettxout', [accFundTxid, accOutputIndex]);
-    
-    if (parentUtxoMain !== null || parentAccUtxoMain !== null) {
-        console.error("❌ FAILURE: Parent contract UTXOs are still unspent on Main-Chain after scriptpath split!");
-        process.exit(1);
-    }
-    console.log("   - ✔️ Success: Parent contract UTXOs are spent on Main-Chain.");
-
-    const newSplitUtxoMain = await mainRpc.call('gettxout', [splitTxidMain, 0]);
-    const newAccSplitUtxoMain = await mainRpc.call('gettxout', [accSplitTxidMain, 0]);
-    if (newSplitUtxoMain === null || newAccSplitUtxoMain === null) {
-        console.error("❌ FAILURE: New split UTXOs are not found/confirmed on Main-Chain!");
-        process.exit(1);
-    }
-    console.log(`   - ✔️ Success: New split UTXOs are confirmed on Main-Chain:
-     Initiator: ${newSplitUtxoMain.value} BTC
-     Acceptor : ${newAccSplitUtxoMain.value} BTC`);
-
-    // Verify Knots (BIP110-Chain) before executing BIP110 spend
-    console.log("\n6c. Verifying parent UTXO state on BIP110-Chain (Should still be UNSPENT)...");
-    const parentUtxoBip110 = await bip110Rpc.call('gettxout', [fundTxid, outputIndex]);
-    const parentAccUtxoBip110 = await bip110Rpc.call('gettxout', [accFundTxid, accOutputIndex]);
-    if (parentUtxoBip110 === null || parentAccUtxoBip110 === null) {
-        console.error("❌ FAILURE: Parent contract UTXOs were spent on BIP110-Chain despite BIP110 consensus rules!");
-        process.exit(1);
-    }
-    console.log(`   - ✔️ Success: Parent contract UTXOs remain unspent and completely valid on BIP110-Chain:
-     Initiator: ${parentUtxoBip110.value} BTC
-     Acceptor : ${parentAccUtxoBip110.value} BTC`);
-
-    // 7. Replay Verification: BIP110 MUST reject the Main Chain spends (both should fail)
-    console.log("\n7. Replaying Main Chain spends to BIP110 Node (Should FAIL)...");
-    
-    // Attempt Initiator replay
-    try {
-        await bip110Rpc.call('sendrawtransaction', [rawMainHex]);
-        console.error("❌ FAILURE: BIP110 Node accepted the Initiator's OP_IF spend!");
-        process.exit(1);
-    } catch (err: any) {
-        console.log("   - BIP110 Node successfully REJECTED Initiator's OP_IF transaction! Error:");
-        console.log(`     "${err.message}"`);
-    }
-
-    // Attempt Acceptor replay
-    try {
-        await bip110Rpc.call('sendrawtransaction', [rawAccMainHex]);
-        console.error("❌ FAILURE: BIP110 Node accepted the Acceptor's OP_IF spend!");
-        process.exit(1);
-    } catch (err: any) {
-        console.log("   - BIP110 Node successfully REJECTED Acceptor's OP_IF transaction! Error:");
-        console.log(`     "${err.message}"`);
-    }
-    console.log("   - REPLAY PROTECTION VALIDATED FOR BOTH SIDES SUCCESSFULLY!");
-
-    // 8. BIP110 Chain: Spend via Keypath using Tweaked Key (Schnorr)
-    console.log("\n8. Executing Keypath spends on BIP110-Chain...");
-
-    const outputIndexBip110 = await findOutputIndex(bip110Rpc, fundTxid, Buffer.from(splitPayment.output!).toString('hex'));
-    console.log(`   - Output Index of fundTxid on BIP110-Chain: ${outputIndexBip110}`);
-
-    const txOutBip110 = await bip110Rpc.call('gettxout', [fundTxid, outputIndexBip110]);
-    console.log(`   - UTXO status of fundTxid on BIP110-Chain:`, txOutBip110);
-
-    // Initiator BIP110 Keypath spend
-    const receiverAddrBip110 = await bip110Rpc.call('getnewaddress');
-    const bip110SpendTx = PureBitcoinSwap.buildKeypathSplitTx(
-        initiator, fundTxid, outputIndexBip110, 1000000000n, 999000000n, receiverAddrBip110, splitPayment, splitScript, bitcoin.networks.regtest
-    );
-    const splitTxidBip110 = await bip110Rpc.call('sendrawtransaction', [bip110SpendTx.toHex()]);
-    console.log(`   - Initiator keypath split accepted on BIP110-Chain! TxID: ${splitTxidBip110}`);
-
-    // Acceptor BIP110 Keypath spend
-    const accOutputIndexBip110 = await findOutputIndex(bip110Rpc, accFundTxid, Buffer.from(accSplitPayment.output!).toString('hex'));
-    const accReceiverAddrBip110 = await bip110Rpc.call('getnewaddress');
-    const accBip110SpendTx = PureBitcoinSwap.buildKeypathSplitTx(
-        acceptor, accFundTxid, accOutputIndexBip110, 1000000000n, 999000000n, accReceiverAddrBip110, accSplitPayment, accSplitScript, bitcoin.networks.regtest
-    );
-    const accSplitTxidBip110 = await bip110Rpc.call('sendrawtransaction', [accBip110SpendTx.toHex()]);
-    console.log(`   - Acceptor keypath split accepted on BIP110-Chain! TxID: ${accSplitTxidBip110}`);
-
-    const minerAddrBip110 = await bip110Rpc.call('getnewaddress');
-    await bip110Rpc.call('generatetoaddress', [1, minerAddrBip110]);
-
-    console.log("\n8b. Verifying UTXO state on BIP110-Chain after keypath spend...");
-    const parentUtxoBip110Post = await bip110Rpc.call('gettxout', [fundTxid, outputIndexBip110]);
-    const parentAccUtxoBip110Post = await bip110Rpc.call('gettxout', [accFundTxid, accOutputIndexBip110]);
-    if (parentUtxoBip110Post !== null || parentAccUtxoBip110Post !== null) {
-        console.error("❌ FAILURE: Parent contract UTXOs are still unspent on BIP110-Chain after keypath split!");
-        process.exit(1);
-    }
-    console.log("   - ✔️ Success: Parent contract UTXOs are spent on BIP110-Chain.");
-
-    const newSplitUtxoBip110 = await bip110Rpc.call('gettxout', [splitTxidBip110, 0]);
-    const newAccSplitUtxoBip110 = await bip110Rpc.call('gettxout', [accSplitTxidBip110, 0]);
-    if (newSplitUtxoBip110 === null || newAccSplitUtxoBip110 === null) {
-        console.error("❌ FAILURE: New keypath split UTXOs are not found/confirmed on BIP110-Chain!");
-        process.exit(1);
-    }
-    console.log(`   - ✔️ Success: New keypath split UTXOs are confirmed on BIP110-Chain:
-     Initiator: ${newSplitUtxoBip110.value} B110
-     Acceptor : ${newAccSplitUtxoBip110.value} B110`);
-
-    console.log("\n==================================================");
-    console.log("🎉 COIN SPLIT PRIMITIVE TEST COMPLETED SUCCESSFULLY!");
-    console.log("==================================================");
+    const blakeMiner = await bip110Rpc.call('getnewaddress');
+    await bip110Rpc.call('generatetoaddress', [1, blakeMiner]);
+    if (await mainRpc.call('gettxout', [fundingTxid, vout]) === null) throw new Error('Original output was spent on Bitcoin');
+    if (await bip110Rpc.call('gettxout', [fundingTxid, vout]) !== null) throw new Error('Original output remains on BLAKE2b');
+    if (await bip110Rpc.call('gettxout', [splitTxid, 0]) === null) throw new Error('BLAKE2b split destination is missing');
+    console.log(`Native split verified: ${splitTxid}`);
 }
 
-runSplitPrimitiveTest().catch(err => {
-    console.error(`❌ Split Test Failed: ${err.message}`);
+run().catch(error => {
+    console.error(`Split test failed: ${error.message}`);
     process.exit(1);
 });
