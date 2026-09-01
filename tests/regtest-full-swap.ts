@@ -102,6 +102,8 @@ async function runFullSwapTest() {
     const preimage = Buffer.from(preimageStr, 'utf8');
     const hashLock = PureBitcoinSwap.computeHashLock(preimageStr);
     const lockTime = 2000;
+    // One NUMS tweak per run, shared by both HTLCs (internal key = H + u*G)
+    const numsTweak = PureBitcoinSwap.generateNumsTweak();
 
     // 5. Fund Split Contract Outputs (Block 101)
     console.log("\n4. Funding the Split contract addresses for both Initiator and Acceptor...");
@@ -185,7 +187,7 @@ async function runFullSwapTest() {
     const initSplitOutIdxBip110Tx = await findOutputIndex(bip110Rpc, initSplitTxidBip110, initSplitDestScriptHexBip110);
 
     const htlcBip110 = PureBitcoinSwap.createTaprootHtlc(
-        Buffer.from(initiator.publicKey), // internal aggregator
+        numsTweak, // NUMS tweak: internal key = H + u*G
         hashLock,
         Buffer.from(acceptor.publicKey), // recipient
         Buffer.from(initiator.publicKey), // refund owner
@@ -205,7 +207,7 @@ async function runFullSwapTest() {
 
     // B. Main-Chain HTLC (funded by Acceptor's split output)
     const htlcMain = PureBitcoinSwap.createTaprootHtlc(
-        Buffer.from(acceptor.publicKey), // internal aggregator
+        numsTweak, // NUMS tweak: internal key = H + u*G
         hashLock,
         Buffer.from(initiator.publicKey), // recipient
         Buffer.from(acceptor.publicKey), // refund owner
@@ -234,7 +236,7 @@ async function runFullSwapTest() {
 
     const claimTxMain = PureBitcoinSwap.buildHtlcClaimTx(
         initiator, htlcFundTxidMain, htlcMainOutIdx, 998000000n, 997000000n, initiatorClaimWalletAddr, hashLock, preimage,
-        htlcMain, Buffer.from(acceptor.publicKey), Buffer.from(acceptor.publicKey), Math.round(lockTime / 2), bitcoin.networks.regtest
+        htlcMain, numsTweak, Buffer.from(acceptor.publicKey), Math.round(lockTime / 2), bitcoin.networks.regtest
     );
 
     const claimTxidMain = await mainRpc.call('sendrawtransaction', [claimTxMain.toHex()]);
@@ -253,7 +255,7 @@ async function runFullSwapTest() {
 
     const claimTxBip110 = PureBitcoinSwap.buildHtlcClaimTx(
         acceptor, htlcFundTxidBip110, htlcBip110OutIdx, 998000000n, 997000000n, acceptorClaimWalletAddr, hashLock, extractedPreimage,
-        htlcBip110, Buffer.from(initiator.publicKey), Buffer.from(initiator.publicKey), lockTime, bitcoin.networks.regtest
+        htlcBip110, numsTweak, Buffer.from(initiator.publicKey), lockTime, bitcoin.networks.regtest
     );
 
     const claimTxidBip110 = await bip110Rpc.call('sendrawtransaction', [claimTxBip110.toHex()]);

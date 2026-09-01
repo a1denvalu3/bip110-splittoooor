@@ -56,6 +56,58 @@ describe('Production Mempool explorer client', () => {
         ]);
     });
 
+    it('rotates to the next explorer when a request stalls without a response', async () => {
+        const requests: string[] = [];
+        const response = { data: [] };
+        const stall = () => Promise.reject({ message: 'timeout of 5000ms exceeded', code: 'ECONNABORTED' });
+        const firstHttp = {
+            get: async (url: string) => { requests.push(url); return stall(); },
+            post: async () => ({ data: '' })
+        } as any;
+        const secondHttp = {
+            get: async (url: string) => { requests.push(url); return response; },
+            post: async () => ({ data: '' })
+        } as any;
+        const rotations: string[] = [];
+        const pool = new RotatingExplorerClient([
+            new MempoolExplorerClient('https://one.example', firstHttp),
+            new MempoolExplorerClient('https://two.example', secondHttp)
+        ], (from, to) => rotations.push(`${from}->${to}`));
+
+        expect(await pool.getAddressUtxos('bc1ptest')).to.deep.equal([]);
+        expect(requests).to.deep.equal([
+            'https://one.example/api/address/bc1ptest/utxo',
+            'https://two.example/api/address/bc1ptest/utxo'
+        ]);
+        expect(rotations).to.deep.equal(['https://one.example->https://two.example']);
+    });
+
+    it('does not rotate on deterministic 4xx answers', async () => {
+        const requests: string[] = [];
+        const notFound = () => Promise.reject({ message: 'not found', response: { status: 404 } });
+        const firstHttp = {
+            get: async (url: string) => { requests.push(url); return notFound(); },
+            post: async () => ({ data: '' })
+        } as any;
+        const secondHttp = {
+            get: async (url: string) => { requests.push(url); return { data: [] }; },
+            post: async () => ({ data: '' })
+        } as any;
+        const pool = new RotatingExplorerClient([
+            new MempoolExplorerClient('https://one.example', firstHttp),
+            new MempoolExplorerClient('https://two.example', secondHttp)
+        ]);
+
+        try {
+            await pool.getAddressUtxos('bc1ptest');
+            expect.fail('Expected the 404 to propagate');
+        } catch (error) {
+            expect(error).to.be.instanceOf(ExplorerRequestError);
+            expect((error as ExplorerRequestError).status).to.equal(404);
+        }
+        expect(requests).to.deep.equal(['https://one.example/api/address/bc1ptest/utxo']);
+    });
+
     it('normalizes the base URL and uses the transaction status endpoint', async () => {
         const requests: string[] = [];
         const http = {

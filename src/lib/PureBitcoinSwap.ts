@@ -2,6 +2,7 @@ import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { ECPairFactory, ECPairAPI, ECPairInterface } from 'ecpair';
 import { hashForUnifiedKeypath, SIGHASH_ALL_UNIFIED } from './unifiedSighash';
+import { randomBytes } from 'crypto';
 
 // Initialize Elliptic Curve library in bitcoinjs-lib for Schnorr and Taproot
 bitcoin.initEccLib(ecc);
@@ -68,12 +69,37 @@ export class PureBitcoinSwap {
 
     /**
      * 4. Build a Taproot Output committing to both MAST leaves.
+     *
+     * The internal key is K = H + u*G, where H is the BIP341 NUMS point with
+     * unknown discrete logarithm and u (numsTweak) is a 32-byte scalar shared
+     * between the swap participants. Since dlog(K) = dlog(H) + u and dlog(H)
+     * is unknown, NO party can ever key-path spend the escrow — only the
+     * claim and refund script leaves are usable. The counterparty verifies
+     * the construction by re-deriving K from the published u and checking
+     * that it yields the expected HTLC address.
      */
-    /**
-     * 4. Build a Taproot Output committing to both MAST leaves.
-     */
+    static readonly HTLC_NUMS_POINT = Buffer.from('50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0', 'hex');
+
+    // K = H + u*G. Throws if u is not a valid 32-byte scalar.
+    static deriveHtlcInternalKey(numsTweak: Buffer): Buffer {
+        if (!Buffer.isBuffer(numsTweak) || numsTweak.length !== 32) {
+            throw new Error('NUMS tweak must be a 32-byte scalar');
+        }
+        const result = ecc.xOnlyPointAddTweak(new Uint8Array(this.HTLC_NUMS_POINT), new Uint8Array(numsTweak));
+        if (!result) throw new Error('Invalid NUMS tweak scalar');
+        return Buffer.from(result.xOnlyPubkey);
+    }
+
+    // Generate a random NUMS tweak (u) to share with the counterparty.
+    static generateNumsTweak(): Buffer {
+        for (;;) {
+            const tweak = randomBytes(32);
+            try { this.deriveHtlcInternalKey(tweak); return tweak; } catch { /* retry */ }
+        }
+    }
+
     static createTaprootHtlc(
-        internalPubKey: Buffer, // Aggregated MuSig2 key
+        numsTweak: Buffer, // u scalar; internal key = H + u*G (key path unspendable)
         hashLock: Buffer,
         recipientPubKey: Buffer,
         refundPubKey: Buffer,
@@ -87,7 +113,7 @@ export class PureBitcoinSwap {
         const refundLeaf = { output: new Uint8Array(refundScript) };
 
         return bitcoin.payments.p2tr({
-            internalPubkey: this.getXOnlyPubKey(internalPubKey),
+            internalPubkey: this.deriveHtlcInternalKey(numsTweak),
             scriptTree: [claimLeaf, refundLeaf],
             network
         });
@@ -317,7 +343,7 @@ export class PureBitcoinSwap {
         hashLock: Buffer,
         preimage: Buffer,
         htlcPayment: bitcoin.payments.Payment,
-        internalPubKey: Buffer,
+        numsTweak: Buffer,
         refundPubKey: Buffer,
         lockTime: number,
         network: bitcoin.Network = bitcoin.networks.regtest
@@ -342,7 +368,7 @@ export class PureBitcoinSwap {
         const refundLeafInfo = { output: refundScript };
 
         const claimPayment = bitcoin.payments.p2tr({
-            internalPubkey: this.getXOnlyPubKey(internalPubKey),
+            internalPubkey: this.deriveHtlcInternalKey(numsTweak),
             scriptTree: [claimLeafInfo, refundLeafInfo] as any,
             redeem: {
                 output: claimScript,
@@ -376,7 +402,7 @@ export class PureBitcoinSwap {
         hashLock: Buffer,
         recipientPubKey: Buffer,
         htlcPayment: bitcoin.payments.Payment,
-        internalPubKey: Buffer,
+        numsTweak: Buffer,
         lockTime: number,
         network: bitcoin.Network = bitcoin.networks.regtest
     ): bitcoin.Transaction {
@@ -407,7 +433,7 @@ export class PureBitcoinSwap {
         const refundLeafInfo = { output: refundScript };
 
         const refundPayment = bitcoin.payments.p2tr({
-            internalPubkey: this.getXOnlyPubKey(internalPubKey),
+            internalPubkey: this.deriveHtlcInternalKey(numsTweak),
             scriptTree: [claimLeafInfo, refundLeafInfo] as any,
             redeem: {
                 output: refundScript,
@@ -497,7 +523,7 @@ export class PureBitcoinSwap {
      */
     static verifyTaprootHtlcAddress(
         addressToVerify: string,
-        internalPubKey: Buffer,
+        numsTweak: Buffer,
         hashLock: Buffer,
         recipientPubKey: Buffer,
         refundPubKey: Buffer,
@@ -506,7 +532,7 @@ export class PureBitcoinSwap {
     ): boolean {
         try {
             const expectedHtlc = this.createTaprootHtlc(
-                internalPubKey,
+                numsTweak,
                 hashLock,
                 recipientPubKey,
                 refundPubKey,
@@ -524,7 +550,7 @@ export class PureBitcoinSwap {
      */
     static verifyTaprootHtlcOutput(
         outputToVerify: Buffer,
-        internalPubKey: Buffer,
+        numsTweak: Buffer,
         hashLock: Buffer,
         recipientPubKey: Buffer,
         refundPubKey: Buffer,
@@ -533,7 +559,7 @@ export class PureBitcoinSwap {
     ): boolean {
         try {
             const expectedHtlc = this.createTaprootHtlc(
-                internalPubKey,
+                numsTweak,
                 hashLock,
                 recipientPubKey,
                 refundPubKey,

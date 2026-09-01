@@ -7,7 +7,7 @@ import { PureBitcoinSwap } from './lib/PureBitcoinSwap';
 import { buildOutpointSet, classifyOutpoint, outpointKey } from '../../../src/lib/utxoClassification';
 import { selectFundingUtxos } from '../../../src/lib/fundingSelection';
 import type { FundingFeeEstimator } from '../../../src/lib/fundingSelection';
-import { deadlineFromHeight, secondLockTimeOffset, validateLockTimeOffset } from '../../../src/lib/timelocks';
+import { deadlineFromHeight, secondLockTimeOffset, validateLockTimeOffset, MIN_CROSS_CHAIN_SAFETY_BLOCKS } from '../../../src/lib/timelocks';
 import { MIN_OFFER_AMOUNT_SATS } from '../../../src/lib/offerPolicy';
 import { 
   Wallet, 
@@ -115,6 +115,19 @@ const API_BASE = (
   (import.meta.env.DEV ? 'http://localhost:4000/api' : '/api')
 ).replace(/\/$/, '');
 
+// Canonical JSON encoding shared with the backend: top-level keys sorted,
+// undefined values skipped. Must produce byte-identical output for signatures.
+const canonicalStringify = (obj: any): string => {
+  const keys = Object.keys(obj).sort();
+  const sortedObj: Record<string, any> = {};
+  for (const key of keys) {
+    if (obj[key] !== undefined) {
+      sortedObj[key] = obj[key];
+    }
+  }
+  return JSON.stringify(sortedObj);
+};
+
 interface UTXO {
   txid: string;
   vout: number;
@@ -132,6 +145,7 @@ interface Offer {
   acceptorPubKey?: string;
   acceptorBtcAmount: number;
   hashLock: string;
+  numsTweak?: string;
   lockTime: number;
   secondLockTime: number;
   lockTimeOffset: number;
@@ -484,9 +498,30 @@ export default function App() {
     return networkMode === 'mainnet' ? bitcoin.networks.bitcoin : bitcoin.networks.regtest;
   };
 
+  // Query a fresh block height straight from the node proxy (bypasses polled state).
   const getFreshChainHeight = async (chain: 'main' | 'bip110'): Promise<number> => {
     const response = await axios.get(`${API_BASE}/node/info`);
-    return chain === 'main' ? response.data.mainHeight : response.data.bip110Height;
+    const height = chain === 'main' ? response.data.mainHeight : response.data.bip110Height;
+    if (!Number.isFinite(height) || height <= 0) {
+      throw new Error(`Cannot determine the current ${chain === 'main' ? 'Bitcoin' : 'BIP110'} block height.`);
+    }
+    return height;
+  };
+
+  // The NUMS tweak committed in the offer record derives the HTLC internal key
+  // (K = H + u*G), making the key path unspendable. Old offers lack it.
+  const getOfferNumsTweak = (offer: Offer): Buffer => {
+    if (!offer.numsTweak) {
+      throw new Error('Offer predates the NUMS construction and cannot be used');
+    }
+    return Buffer.from(offer.numsTweak, 'hex');
+  };
+
+  // F18: show the exact fee and change before broadcasting any fee-paying transaction.
+  const confirmFeeDetails = (feeSats: number | bigint, changeSats: number | bigint): boolean => {
+    return window.confirm(
+      `Transaction fee review:\n\nNetwork fee: ${feeSats} sats\nChange returned to you: ${changeSats} sats\n\nProceed with broadcast?`
+    );
   };
 
   const getSecondHtlcLockTime = (offer: Offer, network: bitcoin.Network): number => {
@@ -496,7 +531,7 @@ export default function App() {
 
     const commonArgs = [
       secondHtlcAddress,
-      Buffer.from(offer.initiatorPubKey, 'hex'),
+      getOfferNumsTweak(offer),
       Buffer.from(offer.hashLock, 'hex'),
       Buffer.from(offer.initiatorPubKey, 'hex'),
       Buffer.from(offer.acceptorPubKey, 'hex')
@@ -595,7 +630,7 @@ export default function App() {
     if (!address || !txid || vout === undefined || !deadline) throw new Error('The committed HTLC funding data is incomplete.');
 
     const validContract = PureBitcoinSwap.verifyTaprootHtlcAddress(
-      address, Buffer.from(offer.initiatorPubKey, 'hex'), Buffer.from(offer.hashLock, 'hex'),
+      address, getOfferNumsTweak(offer), Buffer.from(offer.hashLock, 'hex'),
       recipient, refund, deadline, getNetwork()
     );
     if (!validContract) throw new Error('The committed HTLC address does not match the independently reconstructed contract.');
@@ -795,7 +830,7 @@ export default function App() {
         const keyPair = getKeyPairForPubKey(Buffer.from(refundPubKey).toString('hex'), net);
 
         const htlcPayment = PureBitcoinSwap.createTaprootHtlc(
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           recipientPubKey,
           refundPubKey,
@@ -815,10 +850,12 @@ export default function App() {
           Buffer.from(selectedOffer.hashLock, 'hex'),
           recipientPubKey,
           htlcPayment,
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           selectedOffer.lockTime,
           net
         );
+
+        if (!confirmFeeDetails(refundFeeSats, 0)) throw new Error('Refund broadcast cancelled by user.');
 
         // Broadcast raw tx
         const settlementRes = await axios.post(`${API_BASE}/tx/broadcast`, {
@@ -862,7 +899,7 @@ export default function App() {
         const keyPair = getKeyPairForPubKey(Buffer.from(secondHtlcRefund).toString('hex'), net);
 
         const htlcPayment = PureBitcoinSwap.createTaprootHtlc(
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           secondHtlcRecipient,
           secondHtlcRefund,
@@ -882,10 +919,12 @@ export default function App() {
           Buffer.from(selectedOffer.hashLock, 'hex'),
           secondHtlcRecipient,
           htlcPayment,
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           requiredLockTime,
           net
         );
+
+        if (!confirmFeeDetails(refundFeeSats, 0)) throw new Error('Refund broadcast cancelled by user.');
 
         // Broadcast raw tx
         const settlementRes = await axios.post(`${API_BASE}/tx/broadcast`, {
@@ -945,7 +984,8 @@ export default function App() {
     };
   };
 
-  // Find derived keypair in history by public key hex, or return the active keypair as fallback
+  // Find derived keypair in history by public key hex; never silently falls back
+  // to the active keypair, which would sign with the wrong key.
   const getKeyPairForPubKey = (pubKeyHex: string, network: bitcoin.Network): any => {
     for (let i = 0; i <= maxIndex; i++) {
       const kp = deriveKeyPairForIndex(masterPrivateKey, i, network);
@@ -953,8 +993,7 @@ export default function App() {
         return kp;
       }
     }
-    // Fallback to active private key
-    return ECPair.fromPrivateKey(Buffer.from(privateKey, 'hex'), { network });
+    throw new Error('Offer pubkey is not derived from the active wallet');
   };
 
   const getRecommendedFeeRate = async (chain: 'main' | 'bip110'): Promise<number> => {
@@ -962,7 +1001,7 @@ export default function App() {
 
     const res = await axios.get(`${API_BASE}/fees/recommended?chain=${chain}`, { timeout: 5000 });
     const rate = Number(res.data.halfHourFee || res.data.hourFee);
-    if (!Number.isFinite(rate) || rate <= 0) {
+    if (!Number.isFinite(rate) || rate <= 0 || rate > 500) {
       throw new Error(`Explorer returned an invalid fee rate for ${chain}`);
     }
     return rate;
@@ -1461,8 +1500,22 @@ export default function App() {
           return;
         }
 
+        // F10: the master key must be a 32-byte hex string AND a valid secp256k1 private key.
+        if (!/^[0-9a-fA-F]{64}$/.test(data.masterPrivateKey) || !ecc.isPrivate(Buffer.from(data.masterPrivateKey, 'hex'))) {
+          showToast('Invalid recovery file: the master private key is not a valid secp256k1 private key.', 'error');
+          return;
+        }
+
+        if (data.networkMode && data.networkMode !== networkMode) {
+          showToast(`Recovery file is for ${data.networkMode} mode, but the app is in ${networkMode} mode. Switch networks first.`, 'error');
+          return;
+        }
+
+        // Show the first derived address of the wallet being restored so the
+        // user can eyeball it before overwriting the active wallet.
+        const restoredFirstKeys = deriveKeysForIndex(data.masterPrivateKey, 0, getNetwork());
         const confirmed = window.confirm(
-          `Are you sure you want to restore this wallet?\n\nThis will overwrite your current Master Private Key (${masterPrivateKey.substring(0, 10)}...) and derived addresses with the ones from the backup.\n\nMake sure you have backed up any current keys first!`
+          `Are you sure you want to restore this wallet?\n\nThis will overwrite your current Master Private Key (${masterPrivateKey.substring(0, 10)}...) and derived addresses with the ones from the backup.\n\nFirst derived address (index 0) of the restored wallet:\n${restoredFirstKeys.ownAddress}\n\nMake sure you have backed up any current keys first!`
         );
         if (!confirmed) return;
 
@@ -1847,6 +1900,12 @@ export default function App() {
     const fee = BigInt(feeSats);
     const outputSats = inputSats - fee;
 
+    if (!confirmFeeDetails(feeSats, 0)) {
+      showToast('Split broadcast cancelled by user.', 'info');
+      setSplittingBilateral(false);
+      return;
+    }
+
     let bip110Txid = '';
     let bip110Error = '';
     let bip110Success = false;
@@ -1944,6 +2003,9 @@ export default function App() {
       const finalHasChange = inputSats > BigInt(withdrawSats) + BigInt(initialFeeSats);
       const finalFeeSats = await calculateTxFee('withdraw', finalHasChange, targetChain);
       const changeAddress = finalHasChange ? getNewChangeAddress(net) : undefined;
+
+      const changeSats = finalHasChange ? inputSats - BigInt(withdrawSats) - BigInt(finalFeeSats) : 0n;
+      if (!confirmFeeDetails(finalFeeSats, changeSats)) throw new Error('Withdrawal broadcast cancelled by user.');
 
       showToast(`Signing withdrawal from Address #${utxoIndex + 1}...`, "info");
 
@@ -2043,17 +2105,6 @@ export default function App() {
   };
 
   const secureUpdateOffer = async (offerId: string, fields: Partial<Offer>, signerRole: 'initiator' | 'acceptor') => {
-    const canonicalStringify = (obj: any): string => {
-      const keys = Object.keys(obj).sort();
-      const sortedObj: Record<string, any> = {};
-      for (const key of keys) {
-        if (obj[key] !== undefined) {
-          sortedObj[key] = obj[key];
-        }
-      }
-      return JSON.stringify(sortedObj);
-    };
-
     const msg = `update-offer:${offerId}:${canonicalStringify(fields)}`;
     const msgHash = bitcoin.crypto.sha256(Buffer.from(msg));
     
@@ -2134,16 +2185,29 @@ export default function App() {
 
       const lockTimeOffset = validateLockTimeOffset(newOfferLocktime);
 
-      const res = await axios.post(`${API_BASE}/offers`, {
+      // F1: fresh NUMS tweak — the HTLC internal key becomes H + u*G, unspendable via key path.
+      const numsTweak = PureBitcoinSwap.generateNumsTweak().toString('hex');
+
+      // F2: prove ownership of the initiator key by signing the canonical offer fields.
+      const offerFields = {
         initiatorPubKey: publicKey,
         initiatorB110Amount: Number(newOfferB110),
         acceptorBtcAmount: Number(newOfferBtc),
         hashLock: hashLockHex,
         lockTimeOffset,
-        networkMode,
         backingTxid,
         backingVout,
-        backingChain
+        backingChain,
+        numsTweak
+      };
+      const createMessage = `create-offer:${canonicalStringify(offerFields)}`;
+      const createPair = ECPair.fromPrivateKey(Buffer.from(privateKey, 'hex'));
+      const signature = Buffer.from(createPair.sign(bitcoin.crypto.sha256(Buffer.from(createMessage)))).toString('hex');
+
+      const res = await axios.post(`${API_BASE}/offers`, {
+        ...offerFields,
+        networkMode,
+        signature
       });
 
       // Save preimage locally associated with Offer ID so we can claim later
@@ -2182,11 +2246,27 @@ export default function App() {
       if (!fundingSelection) {
         throw new Error(`insufficient split ${targetChain === 'main' ? 'BTC' : 'BIP110'} balance for the contract, coordinator fee, and network fee`);
       }
-      const acceptMessage = `accept-offer:${offer.id}:${publicKey}`;
+
+      // F9: prove ownership of a confirmed split UTXO on the counter-chain.
+      // Prefer the smallest sufficient UTXO from the wallet's split set
+      // (populated via the /api/wallet/utxos polling flow).
+      const acceptorFundingUtxo = getSplitUtxosForChain(targetChain)
+        .filter(u => u.amount >= targetAmount)
+        .sort((a, b) => a.amount - b.amount)[0];
+      if (!acceptorFundingUtxo) {
+        throw new Error(
+          `No confirmed split ${targetChain === 'main' ? 'BTC' : 'B110'} UTXO covers the required ${targetAmount} sats on the counter-chain. ` +
+          `Split/fund coins on that chain first.`
+        );
+      }
+
+      const acceptMessage = `accept-offer:${offer.id}:${publicKey}:${acceptorFundingUtxo.txid}:${acceptorFundingUtxo.vout}`;
       const acceptPair = ECPair.fromPrivateKey(Buffer.from(privateKey, 'hex'));
       const signature = Buffer.from(acceptPair.sign(bitcoin.crypto.sha256(Buffer.from(acceptMessage)))).toString('hex');
       const res = await axios.post(`${API_BASE}/offers/${offer.id}/accept`, {
         acceptorPubKey: publicKey,
+        acceptorFundingTxid: acceptorFundingUtxo.txid,
+        acceptorFundingVout: acceptorFundingUtxo.vout,
         signature
       });
       showToast('Offer accepted! Launching the Swap Wizard...', 'success');
@@ -2194,7 +2274,10 @@ export default function App() {
       setActiveTab('wizard');
       await fetchOffers();
     } catch (err: any) {
-      showToast('Accept offer failed: ' + err.message, 'error');
+      const errMsg = err.response?.status === 409
+        ? (err.response?.data?.error || 'This UTXO is already committed to another offer.')
+        : err.message;
+      showToast(`Accept offer failed: ${errMsg}`, 'error');
     }
   };
 
@@ -2213,6 +2296,15 @@ export default function App() {
         const currentHeight = await getFreshChainHeight(targetChain);
         const firstHtlcLockTime = deadlineFromHeight(currentHeight, validateLockTimeOffset(selectedOffer.lockTimeOffset));
 
+        // F2: only fund offers whose preimage was generated on this device.
+        const localPreimage = sessionStorage.getItem(`preimage_${selectedOffer.id}`);
+        if (!localPreimage) {
+          throw new Error('No local preimage for this offer — refusing to fund an offer this device did not create');
+        }
+        if (Buffer.from(bitcoin.crypto.sha256(Buffer.from(localPreimage, 'hex'))).toString('hex') !== selectedOffer.hashLock) {
+          throw new Error('Local preimage does not match the offer hashLock — refusing to fund');
+        }
+
         showToast(`Building ${targetChain === 'main' ? 'BTC' : 'B110'} HTLC contract locally...`, 'info');
         
         // 1. Generate HTLC outputs locally
@@ -2220,7 +2312,7 @@ export default function App() {
         const refundPubKey = Buffer.from(selectedOffer.initiatorPubKey, 'hex');
 
         const htlc = PureBitcoinSwap.createTaprootHtlc(
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           recipientPubKey,
           refundPubKey,
@@ -2274,6 +2366,11 @@ export default function App() {
         );
         const htlcVout = assertConstructedFundingOutput(tx, htlc.address!, targetSats);
 
+        const fundingChangeSats = fundingSelection.hasChange
+          ? fundingSelection.totalInputSats - targetSats - coordinatorFee - fundingSelection.feeSats
+          : 0n;
+        if (!confirmFeeDetails(fundingSelection.feeSats, fundingChangeSats)) throw new Error('Funding broadcast cancelled by user.');
+
         // 4. Broadcast via server
         const broadcastRes = await axios.post(`${API_BASE}/tx/broadcast`, {
           hex: tx.toHex(),
@@ -2319,7 +2416,7 @@ export default function App() {
 
         const isFirstHtlcValid = PureBitcoinSwap.verifyTaprootHtlcAddress(
           firstHtlcAddress,
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           firstHtlcRecipient,
           firstHtlcRefund,
@@ -2334,6 +2431,13 @@ export default function App() {
         const firstChain: 'main' | 'bip110' = isBtcBacking ? 'main' : 'bip110';
         await verifyFundingOnClient(selectedOffer, firstChain);
 
+        // F3: refuse to fund when the first HTLC expires too soon — the acceptor
+        // needs a safe window to claim or refund across both chains.
+        const firstChainHeight = await getFreshChainHeight(firstChain);
+        if (firstChainHeight + MIN_CROSS_CHAIN_SAFETY_BLOCKS >= selectedOffer.lockTime) {
+          throw new Error('Unsafe timelock window — the first HTLC expires too soon; refusing to fund');
+        }
+
         showToast(`Building ${targetChain === 'main' ? 'BTC' : 'B110'} HTLC contract locally...`, 'info');
 
         // 1. Generate second HTLC outputs locally
@@ -2346,7 +2450,7 @@ export default function App() {
         );
 
         const htlc = PureBitcoinSwap.createTaprootHtlc(
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           secondHtlcRecipient,
           secondHtlcRefund,
@@ -2385,6 +2489,11 @@ export default function App() {
           coordinatorFee
         );
         const htlcVout = assertConstructedFundingOutput(tx, htlc.address!, targetSats);
+
+        const fundingChangeSats = fundingSelection.hasChange
+          ? fundingSelection.totalInputSats - targetSats - coordinatorFee - fundingSelection.feeSats
+          : 0n;
+        if (!confirmFeeDetails(fundingSelection.feeSats, fundingChangeSats)) throw new Error('Funding broadcast cancelled by user.');
 
         // 4. Broadcast via server
         const broadcastRes = await axios.post(`${API_BASE}/tx/broadcast`, {
@@ -2429,7 +2538,7 @@ export default function App() {
 
         const isSecondHtlcValid = PureBitcoinSwap.verifyTaprootHtlcAddress(
           targetAddress,
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           secondHtlcRecipient,
           secondHtlcRefund,
@@ -2458,7 +2567,7 @@ export default function App() {
         // Build and sign claim transaction locally!
         const keyPair = getKeyPairForPubKey(selectedOffer.initiatorPubKey, net);
         const htlcPayment = PureBitcoinSwap.createTaprootHtlc(
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           secondHtlcRecipient,
           secondHtlcRefund,
@@ -2477,11 +2586,13 @@ export default function App() {
           Buffer.from(selectedOffer.hashLock, 'hex'),
           Buffer.from(savedPreimage, 'hex'), 
           htlcPayment,
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           secondHtlcRefund,
           secondHtlcLockTime,
           net
         );
+
+        if (!confirmFeeDetails(feeSats, 0)) throw new Error('Claim broadcast cancelled by user.');
 
         // Broadcast raw tx
         const settlementRes = await axios.post(`${API_BASE}/tx/broadcast`, {
@@ -2515,7 +2626,7 @@ export default function App() {
 
         const isFirstHtlcValid = PureBitcoinSwap.verifyTaprootHtlcAddress(
           targetAddress,
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           firstHtlcRecipient,
           firstHtlcRefund,
@@ -2534,7 +2645,7 @@ export default function App() {
         // Build and sign claim transaction locally!
         const keyPair = getKeyPairForPubKey(Buffer.from(firstHtlcRecipient).toString('hex'), net);
         const htlcPayment = PureBitcoinSwap.createTaprootHtlc(
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           Buffer.from(selectedOffer.hashLock, 'hex'),
           firstHtlcRecipient,
           firstHtlcRefund,
@@ -2553,11 +2664,13 @@ export default function App() {
           Buffer.from(selectedOffer.hashLock, 'hex'),
           Buffer.from(selectedOffer.preimage!, 'hex'), // preimage hex
           htlcPayment,
-          Buffer.from(selectedOffer.initiatorPubKey, 'hex'),
+          getOfferNumsTweak(selectedOffer),
           firstHtlcRefund,
           selectedOffer.lockTime,
           net
         );
+
+        if (!confirmFeeDetails(claimFeeSats, 0)) throw new Error('Claim broadcast cancelled by user.');
 
         const settlementRes = await axios.post(`${API_BASE}/tx/broadcast`, {
           hex: tx.toHex(),

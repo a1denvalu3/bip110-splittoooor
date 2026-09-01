@@ -15,8 +15,8 @@ services:
     image: lncm/bitcoind:v26.0
     container_name: bitcoind-main
     ports:
-      - "18443:18443"
-      - "18445:18444" # P2P port
+      - "127.0.0.1:18443:18443"
+      - "127.0.0.1:18445:18444" # P2P port
     command:
       - -regtest=1
       - -rpcallowip=0.0.0.0/0
@@ -31,8 +31,8 @@ services:
     image: ghcr.io/retropex/bitcoin:29.4.1.knots20260508rc4
     container_name: bitcoind-bip110
     ports:
-      - "18444:18443" # RPC port
-      - "18446:18444" # P2P port
+      - "127.0.0.1:18444:18443" # RPC port
+      - "127.0.0.1:18446:18444" # P2P port
     command:
       - -regtest=1
       - -rpcallowip=0.0.0.0/0

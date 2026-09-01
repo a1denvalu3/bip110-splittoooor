@@ -100,6 +100,8 @@ async function runRefundAndFailureTest() {
     const correctPreimage = Buffer.from('correct-swap-preimage-proof', 'utf8');
     const incorrectPreimage = Buffer.from('incorrect-bad-preimage-proof', 'utf8');
     const hashLock = PureBitcoinSwap.computeHashLock(correctPreimage.toString('utf8'));
+    // One NUMS tweak per run (internal key = H + u*G, key path unspendable)
+    const numsTweak = PureBitcoinSwap.generateNumsTweak();
 
     // 4. Fund Split Output on BIP110-Chain
     console.log("\n4. Funding the Split contract output for the Initiator...");
@@ -138,7 +140,7 @@ async function runRefundAndFailureTest() {
     // 7. Fund the BIP110 HTLC
     console.log("\n7. Funding the BIP110 HTLC address...");
     const htlcBip110 = PureBitcoinSwap.createTaprootHtlc(
-        Buffer.from(initiator.publicKey),
+        numsTweak,
         hashLock,
         Buffer.from(acceptor.publicKey),
         Buffer.from(initiator.publicKey),
@@ -165,7 +167,7 @@ async function runRefundAndFailureTest() {
     console.log("\n8. Failure Case 1: Testing Claim with incorrect preimage (Should FAIL)...");
     const badClaimTx = PureBitcoinSwap.buildHtlcClaimTx(
         acceptor, htlcFundTxidBip110, htlcBip110OutIdx, 998000000n, 997000000n, acceptorClaimWalletAddr, hashLock, incorrectPreimage,
-        htlcBip110, Buffer.from(initiator.publicKey), Buffer.from(initiator.publicKey), lockTime, bitcoin.networks.regtest
+        htlcBip110, numsTweak, Buffer.from(initiator.publicKey), lockTime, bitcoin.networks.regtest
     );
     try {
         await bip110Rpc.call('sendrawtransaction', [badClaimTx.toHex()]);
@@ -181,7 +183,7 @@ async function runRefundAndFailureTest() {
     const initiatorRefundWalletAddr = await bip110Rpc.call('getnewaddress');
     const prematureRefundTx = PureBitcoinSwap.buildHtlcRefundTx(
         initiator, htlcFundTxidBip110, htlcBip110OutIdx, 998000000n, 997000000n, initiatorRefundWalletAddr, hashLock,
-        Buffer.from(acceptor.publicKey), htlcBip110, Buffer.from(initiator.publicKey), lockTime, bitcoin.networks.regtest
+        Buffer.from(acceptor.publicKey), htlcBip110, numsTweak, lockTime, bitcoin.networks.regtest
     );
     try {
         await bip110Rpc.call('sendrawtransaction', [prematureRefundTx.toHex()]);
@@ -201,7 +203,7 @@ async function runRefundAndFailureTest() {
 
     const finalRefundTx = PureBitcoinSwap.buildHtlcRefundTx(
         initiator, htlcFundTxidBip110, htlcBip110OutIdx, 998000000n, 997000000n, initiatorRefundWalletAddr, hashLock,
-        Buffer.from(acceptor.publicKey), htlcBip110, Buffer.from(initiator.publicKey), lockTime, bitcoin.networks.regtest
+        Buffer.from(acceptor.publicKey), htlcBip110, numsTweak, lockTime, bitcoin.networks.regtest
     );
     const refundTxid = await bip110Rpc.call('sendrawtransaction', [finalRefundTx.toHex()]);
     await bip110Rpc.call('generatetoaddress', [1, minerAddrBip110]);

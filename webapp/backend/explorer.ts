@@ -125,6 +125,28 @@ export class MempoolExplorerClient {
         }
     }
 
+    // Esplora outspend lookup. Returns null when the transaction does not
+    // exist on this chain at all (404), meaning the outpoint is chain-exclusive.
+    async getOutspend(txid: string, vout: number): Promise<{ spent: boolean; confirmed: boolean } | null> {
+        try {
+            const response = await this.http.get(this.api(`/tx/${encodeURIComponent(txid)}/outspend/${vout}`), {
+                timeout: this.timeoutMs
+            });
+            if (typeof response.data?.spent !== 'boolean') {
+                throw new Error('Explorer returned an invalid outspend response');
+            }
+            const confirmed = response.data.spent
+                ? response.data.status?.confirmed === true
+                : false;
+            return { spent: response.data.spent, confirmed };
+        } catch (error) {
+            if (error instanceof ExplorerRequestError) throw error;
+            const status = (error as AxiosError).response?.status;
+            if (status === 404) return null;
+            throw new ExplorerRequestError('Outspend lookup', error);
+        }
+    }
+
     async broadcastTransaction(hex: string): Promise<string> {
         try {
             const response = await this.http.post(this.api('/tx'), hex, {
@@ -247,7 +269,7 @@ export class RotatingExplorerClient {
                 return await operation(client);
             } catch (error) {
                 lastError = error;
-                if (!(error instanceof ExplorerRequestError) || error.status !== 429 || this.clients.length === 1) {
+                if (!this.isTransient(error) || this.clients.length === 1) {
                     throw error;
                 }
                 const from = client.baseUrl;
@@ -256,6 +278,15 @@ export class RotatingExplorerClient {
             }
         }
         throw lastError;
+    }
+
+    // Failures worth failing over from: no response at all (timeout, DNS,
+    // refused, TLS), throttling (429), or upstream/CDN errors (5xx).
+    // 4xx responses are deterministic answers and must not rotate.
+    private isTransient(error: unknown): boolean {
+        if (!(error instanceof ExplorerRequestError)) return false;
+        if (error.status === undefined) return true;
+        return error.status === 429 || error.status >= 500;
     }
 
     getTransactionConfirmations(txid: string): Promise<number> {
@@ -276,6 +307,10 @@ export class RotatingExplorerClient {
 
     getTipHeight(): Promise<number> {
         return this.request(client => client.getTipHeight());
+    }
+
+    getOutspend(txid: string, vout: number): Promise<{ spent: boolean; confirmed: boolean } | null> {
+        return this.request(client => client.getOutspend(txid, vout));
     }
 
     getRecommendedFees(): Promise<RecommendedFees> {
