@@ -251,7 +251,7 @@ export class RotatingExplorerClient {
 
     constructor(
         private readonly clients: MempoolExplorerClient[],
-        private readonly onRotate?: (from: string, to: string) => void
+        private readonly onRotate?: (from: string, to: string, error: unknown) => void
     ) {
         if (clients.length === 0) throw new Error('At least one explorer endpoint is required');
         this.sourceId = clients.map(client => client.baseUrl).join(',');
@@ -274,7 +274,7 @@ export class RotatingExplorerClient {
                 }
                 const from = client.baseUrl;
                 this.activeIndex = (this.activeIndex + 1) % this.clients.length;
-                this.onRotate?.(from, this.clients[this.activeIndex].baseUrl);
+                this.onRotate?.(from, this.clients[this.activeIndex].baseUrl, error);
             }
         }
         throw lastError;

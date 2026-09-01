@@ -146,7 +146,13 @@ const BITCOIN_RPC_HOST = process.env.BITCOIN_RPC_HOST?.trim() || '';
 const BIP110_RPC_HOST = process.env.BIP110_RPC_HOST?.trim() || '';
 const mainnetExplorer = BITCOIN_RPC_HOST ? null : new RotatingExplorerClient(
     BITCOIN_EXPLORER_URLS.map(url => new MempoolExplorerClient(url)),
-    (from, to) => logWarn('explorer.rate_limit_failover', { chain: 'main', from, to })
+    (from, to, error) => logWarn('explorer.endpoint_failover', {
+        chain: 'main',
+        from,
+        to,
+        reason: error instanceof Error ? error.message : String(error),
+        status: error instanceof ExplorerRequestError ? error.status : undefined
+    })
 );
 const bip110Explorer = !BIP110_RPC_HOST && BIP110_EXPLORER_URL
     ? new MempoolExplorerClient(BIP110_EXPLORER_URL)
