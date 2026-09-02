@@ -761,6 +761,12 @@ export default function App() {
     return null;
   };
 
+  // Render sats as a coin amount at full precision, trailing zeros trimmed.
+  // 4-decimal rounding makes distinct small offers display as identical.
+  const formatCoin = (sats: number): string => {
+    return (sats / 100000000).toFixed(8).replace(/\.?0+$/, '');
+  };
+
   const handleSellAmountChange = (valStr: string) => {
     setSellAmountSats(valStr);
     const amountVal = Number(valStr) || 0;
@@ -790,6 +796,44 @@ export default function App() {
       } else {
         setNewOfferBtc(calculatedBuy); // Buying BTC
       }
+    }
+  };
+
+  // Set the sell amount to the largest offer the split balance can fund:
+  // aggregate balance minus network fee and coordinator (maker) fee.
+  const handleMaxSellAmount = async () => {
+    if (!selectedBackingChain) return;
+    try {
+      const candidates = getSplitUtxosForChain(selectedBackingChain);
+      if (candidates.length === 0) return;
+      const aggregate = candidates.reduce((sum, candidate) => sum + candidate.amount, 0);
+      const coordinatorFees = await getCoordinatorFees();
+      const percent = coordinatorFees.makerFeePercent;
+
+      // Conservative: assume a change output and the coordinator fee output.
+      const estimateFee = await createFundingFeeEstimator(selectedBackingChain, true);
+      const fee = estimateFee(candidates.length, true);
+
+      const [whole, fraction = ''] = percent.split('.');
+      const scale = 10 ** fraction.length;
+      const percentNum = Number(whole) * scale + Number(fraction || '0');
+      const percentDen = 100 * scale;
+
+      // Largest amount with amount + fee + ceil(amount * pct/100) <= aggregate
+      let max = Math.floor(((aggregate - fee) * percentDen) / (percentDen + percentNum));
+      if (max > 0 && coordinatorFeeSats(max, percent) === 0n) {
+        // No coordinator fee due at this size: drop the extra output from the fee.
+        const estimateWithoutCoordinator = await createFundingFeeEstimator(selectedBackingChain, false);
+        max = aggregate - estimateWithoutCoordinator(candidates.length, false);
+      }
+      while (max > 0 && BigInt(max) + coordinatorFeeSats(max, percent) > BigInt(aggregate - fee)) max--;
+      if (max < MIN_OFFER_AMOUNT_SATS) {
+        showToast(`Split balance cannot cover the minimum offer of ${MIN_OFFER_AMOUNT_SATS.toLocaleString()} sats plus fees.`, 'error');
+        return;
+      }
+      handleSellAmountChange(String(max));
+    } catch (err: any) {
+      showToast('Could not estimate the maximum amount: ' + err.message, 'error');
     }
   };
 
@@ -1216,7 +1260,7 @@ export default function App() {
         if (!wasPresent && isNotOurs) {
           sendSystemNotification(
             "New Swap Offer Open",
-            `Marketplace: #${o.id} is selling ${(o.initiatorB110Amount / 100000000).toFixed(4)} B110 for ${(o.acceptorBtcAmount / 100000000).toFixed(4)} BTC.`
+            `Marketplace: #${o.id} is selling ${formatCoin(o.initiatorB110Amount)} B110 for ${formatCoin(o.acceptorBtcAmount)} BTC.`
           );
         }
       });
@@ -1999,7 +2043,7 @@ export default function App() {
       }
 
       if (withdrawSats > Number(inputSats) - initialFeeSats) {
-        throw new Error(`Withdraw amount cannot exceed ${((Number(inputSats) - initialFeeSats) / 100000000).toFixed(4)} (input size minus fee).`);
+        throw new Error(`Withdraw amount cannot exceed ${formatCoin(Number(inputSats) - initialFeeSats)} (input size minus fee).`);
       }
 
       const finalHasChange = inputSats > BigInt(withdrawSats) + BigInt(initialFeeSats);
@@ -2566,7 +2610,7 @@ export default function App() {
         // Verification of the amount funded inside the HTLC
         const requiredAmount = isBtcBacking ? selectedOffer.initiatorB110Amount : selectedOffer.acceptorBtcAmount;
         if (BigInt(utxo.amount) < BigInt(requiredAmount - 5000)) {
-          throw new Error(`CRITICAL SECURITY WARNING: The acceptor funded the HTLC with only ${(utxo.amount / 100000000).toFixed(4)} ${targetChain === 'main' ? 'BTC' : 'B110'}, but the agreed amount was ${(requiredAmount / 100000000).toFixed(4)}! Do NOT release the preimage!`);
+          throw new Error(`CRITICAL SECURITY WARNING: The acceptor funded the HTLC with only ${formatCoin(utxo.amount)} ${targetChain === 'main' ? 'BTC' : 'B110'}, but the agreed amount was ${formatCoin(requiredAmount)}! Do NOT release the preimage!`);
         }
 
         // Retrieve locally persisted preimage
@@ -3152,12 +3196,12 @@ export default function App() {
                     <span className="text-xs text-slate-400 block mb-1">Main-Chain Balance</span>
                     <span className="text-lg sm:text-xl font-bold text-emerald-400">
                       {hasBalanceSnapshot
-                        ? `${((mainBalance + ownMainBalance) / 100000000).toFixed(4)} ${networkMode === 'mainnet' ? 'BTC' : 'rBTC'}`
+                        ? `${formatCoin(mainBalance + ownMainBalance)} ${networkMode === 'mainnet' ? 'BTC' : 'rBTC'}`
                         : 'Loading…'}
                     </span>
                     {hasBalanceSnapshot && (
                       <span className="text-[10px] text-slate-500 block mt-0.5 font-medium leading-none">
-                        {(getMainUnsplitBalance() / 100000000).toFixed(4)} Unsplit + {(getMainSplitBalance() / 100000000).toFixed(4)} Split
+                        {formatCoin(getMainUnsplitBalance())} Unsplit + {formatCoin(getMainSplitBalance())} Split
                       </span>
                     )}
                   </div>
@@ -3165,12 +3209,12 @@ export default function App() {
                     <span className="text-xs text-slate-400 block mb-1">BIP110 Balance</span>
                     <span className="text-lg sm:text-xl font-bold text-sky-400">
                       {hasBalanceSnapshot
-                        ? `${((bip110Balance + ownBip110Balance) / 100000000).toFixed(4)} B110`
+                        ? `${formatCoin(bip110Balance + ownBip110Balance)} B110`
                         : 'Loading…'}
                     </span>
                     {hasBalanceSnapshot && (
                       <span className="text-[10px] text-slate-500 block mt-0.5 font-medium leading-none">
-                        {(getBip110UnsplitBalance() / 100000000).toFixed(4)} Unsplit + {(getBip110SplitBalance() / 100000000).toFixed(4)} Split
+                        {formatCoin(getBip110UnsplitBalance())} Unsplit + {formatCoin(getBip110SplitBalance())} Split
                       </span>
                     )}
                   </div>
@@ -3407,7 +3451,7 @@ export default function App() {
                                   </span>
                                 )}
                               </div>
-                              <span className="font-semibold text-emerald-400">{(u.amount / 100000000).toFixed(4)} BTC</span>
+                              <span className="font-semibold text-emerald-400">{formatCoin(u.amount)} BTC</span>
                             </div>
                           );
                         })}
@@ -3454,7 +3498,7 @@ export default function App() {
                                   </span>
                                 )}
                               </div>
-                              <span className="font-semibold text-sky-400">{(u.amount / 100000000).toFixed(4)} B110</span>
+                              <span className="font-semibold text-sky-400">{formatCoin(u.amount)} B110</span>
                             </div>
                           )
                         })}
@@ -3506,25 +3550,25 @@ export default function App() {
                       {/* Main-chain splitAddress outputs */}
                       {mainUtxos.map(u => (
                         <option key={`${u.txid}-${u.vout}-split-main`} value={`main|${u.txid}|${u.vout}`}>
-                          BTC [Contract Addr] ({(u.amount / 100000000).toFixed(4)} BTC | {u.txid.substring(0, 10)}...:{u.vout}) [Addr Index #{u.index !== undefined ? u.index + 1 : 1}]
+                          BTC [Contract Addr] ({formatCoin(u.amount)} BTC | {u.txid.substring(0, 10)}...:{u.vout}) [Addr Index #{u.index !== undefined ? u.index + 1 : 1}]
                         </option>
                       ))}
                       {/* BIP110-chain splitAddress outputs */}
                       {bip110Utxos.map(u => (
                         <option key={`${u.txid}-${u.vout}-split-b110`} value={`bip110|${u.txid}|${u.vout}`}>
-                          B110 [Contract Addr] ({(u.amount / 100000000).toFixed(4)} B110 | {u.txid.substring(0, 10)}...:{u.vout}) [Addr Index #{u.index !== undefined ? u.index + 1 : 1}]
+                          B110 [Contract Addr] ({formatCoin(u.amount)} B110 | {u.txid.substring(0, 10)}...:{u.vout}) [Addr Index #{u.index !== undefined ? u.index + 1 : 1}]
                         </option>
                       ))}
                       {/* Main-chain ownAddress outputs */}
                       {ownMainUtxos.map(u => (
                         <option key={`${u.txid}-${u.vout}-own-main`} value={`main|${u.txid}|${u.vout}`}>
-                          BTC [Own Split Addr] ({(u.amount / 100000000).toFixed(4)} BTC | {u.txid.substring(0, 10)}...:{u.vout}) [Addr Index #{u.index !== undefined ? u.index + 1 : 1}]
+                          BTC [Own Split Addr] ({formatCoin(u.amount)} BTC | {u.txid.substring(0, 10)}...:{u.vout}) [Addr Index #{u.index !== undefined ? u.index + 1 : 1}]
                         </option>
                       ))}
                       {/* BIP110-chain ownAddress outputs */}
                       {ownBip110Utxos.map(u => (
                         <option key={`${u.txid}-${u.vout}-own-b110`} value={`bip110|${u.txid}|${u.vout}`}>
-                          B110 [Own Split Addr] ({(u.amount / 100000000).toFixed(4)} B110 | {u.txid.substring(0, 10)}...:{u.vout}) [Addr Index #{u.index !== undefined ? u.index + 1 : 1}]
+                          B110 [Own Split Addr] ({formatCoin(u.amount)} B110 | {u.txid.substring(0, 10)}...:{u.vout}) [Addr Index #{u.index !== undefined ? u.index + 1 : 1}]
                         </option>
                       ))}
                     </select>
@@ -3779,7 +3823,7 @@ export default function App() {
                                 </span>
                               </div>
                             </div>
-                            <span className="font-semibold text-emerald-400">{(u.amount / 100000000).toFixed(4)} BTC</span>
+                            <span className="font-semibold text-emerald-400">{formatCoin(u.amount)} BTC</span>
                           </div>
                         );
                       })}
@@ -3812,7 +3856,7 @@ export default function App() {
                             {u.confirmations < 1 ? '🛡️ Split (PENDING)' : '🛡️ Split (BTC)'}
                           </span>
                         </div>
-                        <span className="font-semibold text-slate-300">{(u.amount / 100000000).toFixed(4)} BTC</span>
+                        <span className="font-semibold text-slate-300">{formatCoin(u.amount)} BTC</span>
                       </div>
                     ))}
                     
@@ -3834,7 +3878,7 @@ export default function App() {
                             {u.confirmations < 1 ? '🛡️ Split (PENDING)' : '🛡️ Split (BIP110)'}
                           </span>
                         </div>
-                        <span className="font-semibold text-slate-300">{(u.amount / 100000000).toFixed(4)} B110</span>
+                        <span className="font-semibold text-slate-300">{formatCoin(u.amount)} B110</span>
                       </div>
                     ))}
 
@@ -3936,10 +3980,10 @@ export default function App() {
                   >
                     <option value="">-- Choose a chain --</option>
                     <option value="main" disabled={getSplitUtxosForChain('main').length === 0}>
-                      Bitcoin ({(getMainSplitBalance() / 100000000).toFixed(4)} BTC available)
+                      Bitcoin ({formatCoin(getMainSplitBalance())} BTC available)
                     </option>
                     <option value="bip110" disabled={getSplitUtxosForChain('bip110').length === 0}>
-                      BIP110-Chain ({(getBip110SplitBalance() / 100000000).toFixed(4)} B110 available)
+                      BIP110-Chain ({formatCoin(getBip110SplitBalance())} B110 available)
                     </option>
                   </select>
                   {!hasBalanceSnapshot ? (
@@ -3963,17 +4007,28 @@ export default function App() {
                           <label className="text-xs font-bold text-slate-400 block uppercase tracking-wider mb-2">
                             Sell Amount (Sats)
                           </label>
-                          <input
-                            type="number"
-                            min={MIN_OFFER_AMOUNT_SATS}
-                            value={sellAmountSats}
-                            onChange={(e) => handleSellAmountChange(e.target.value)}
-                            placeholder={`Up to aggregate balance minus fees`}
-                            className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 font-mono"
-                          />
+                          <div className="flex gap-2">
+                            <input
+                              type="number"
+                              min={MIN_OFFER_AMOUNT_SATS}
+                              value={sellAmountSats}
+                              onChange={(e) => handleSellAmountChange(e.target.value)}
+                              placeholder={`Up to aggregate balance minus fees`}
+                              className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 font-mono"
+                            />
+                            <button
+                              type="button"
+                              onClick={handleMaxSellAmount}
+                              disabled={fundingCandidates.length === 0}
+                              title="Set the maximum offer amount after network and coordinator fees"
+                              className="px-3 bg-slate-900 border border-slate-800 rounded-xl text-xs font-bold text-indigo-300 hover:border-indigo-500 hover:text-indigo-200 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                            >
+                              MAX
+                            </button>
+                          </div>
                           <span className="text-[10px] text-slate-500 mt-1 block">
                             Minimum offer: <span className="font-semibold text-slate-400">{MIN_OFFER_AMOUNT_SATS.toLocaleString()} sats</span>.{' '}
-                            Aggregate split balance: <span className="font-semibold text-slate-400">{aggregateBalance.toLocaleString()} Sats</span> ({(aggregateBalance / 100000000).toFixed(4)} {chainLabel}) across {fundingCandidates.length} UTXO{fundingCandidates.length === 1 ? '' : 's'}. Fees must also fit within this balance.
+                            Aggregate split balance: <span className="font-semibold text-slate-400">{aggregateBalance.toLocaleString()} Sats</span> ({formatCoin(aggregateBalance)} {chainLabel}) across {fundingCandidates.length} UTXO{fundingCandidates.length === 1 ? '' : 's'}. Fees must also fit within this balance.
                           </span>
                           <span className="text-[10px] text-slate-600 mt-1 block">
                             Funding inputs and the offer's anchor outpoint are selected automatically from this chain.
@@ -4018,11 +4073,11 @@ export default function App() {
                         <span className="text-sm font-semibold text-slate-200">
                           {isMain ? (
                             <>
-                              Selling <span className="text-emerald-400 font-mono">{(Number(newOfferBtc) / 100000000).toFixed(4)} BTC</span> ⇆ Buying <span className="text-sky-400 font-mono">{(Number(newOfferB110) / 100000000).toFixed(4)} B110</span> on BIP110-Chain
+                              Selling <span className="text-emerald-400 font-mono">{formatCoin(Number(newOfferBtc))} BTC</span> ⇆ Buying <span className="text-sky-400 font-mono">{formatCoin(Number(newOfferB110))} B110</span> on BIP110-Chain
                             </>
                           ) : (
                             <>
-                              Selling <span className="text-sky-400 font-mono">{(Number(newOfferB110) / 100000000).toFixed(4)} B110</span> ⇆ Buying <span className="text-emerald-400 font-mono">{(Number(newOfferBtc) / 100000000).toFixed(4)} BTC</span> on Main-Chain
+                              Selling <span className="text-sky-400 font-mono">{formatCoin(Number(newOfferB110))} B110</span> ⇆ Buying <span className="text-emerald-400 font-mono">{formatCoin(Number(newOfferBtc))} BTC</span> on Main-Chain
                             </>
                           )}
                         </span>
@@ -4160,13 +4215,13 @@ export default function App() {
                             <div>
                               <span className="text-slate-400 block font-medium">They Sell (You Buy)</span>
                               <span className="font-semibold text-sky-400">
-                                {o.backingChain === 'main' ? `${(o.acceptorBtcAmount / 100000000).toFixed(4)} BTC` : `${(o.initiatorB110Amount / 100000000).toFixed(4)} B110`}
+                                {o.backingChain === 'main' ? `${formatCoin(o.acceptorBtcAmount)} BTC` : `${formatCoin(o.initiatorB110Amount)} B110`}
                               </span>
                             </div>
                             <div>
                               <span className="text-slate-400 block font-medium">They Ask (You Pay)</span>
                               <span className="font-semibold text-emerald-400">
-                                {o.backingChain === 'main' ? `${(o.initiatorB110Amount / 100000000).toFixed(4)} B110` : `${(o.acceptorBtcAmount / 100000000).toFixed(4)} BTC`}
+                                {o.backingChain === 'main' ? `${formatCoin(o.initiatorB110Amount)} B110` : `${formatCoin(o.acceptorBtcAmount)} BTC`}
                               </span>
                             </div>
                           </div>
@@ -4175,7 +4230,7 @@ export default function App() {
                             <div className="flex justify-between">
                               <span className="text-slate-500 font-medium">Required Split Balance:</span>
                               <span className="font-semibold text-slate-300">
-                                {(requiredAmount / 100000000).toFixed(4)} {requiredChain}
+                                {formatCoin(requiredAmount)} {requiredChain}
                               </span>
                             </div>
                             <div className="flex justify-between">
@@ -4290,13 +4345,13 @@ export default function App() {
                           <div>
                             <span className="text-slate-400 block font-medium">You Sell</span>
                             <span className="font-semibold text-sky-400">
-                              {o.backingChain === 'main' ? `${(o.acceptorBtcAmount / 100000000).toFixed(4)} BTC` : `${(o.initiatorB110Amount / 100000000).toFixed(4)} B110`}
+                              {o.backingChain === 'main' ? `${formatCoin(o.acceptorBtcAmount)} BTC` : `${formatCoin(o.initiatorB110Amount)} B110`}
                             </span>
                           </div>
                           <div>
                             <span className="text-slate-400 block font-medium">You Receive</span>
                             <span className="font-semibold text-emerald-400">
-                              {o.backingChain === 'main' ? `${(o.initiatorB110Amount / 100000000).toFixed(4)} B110` : `${(o.acceptorBtcAmount / 100000000).toFixed(4)} BTC`}
+                              {o.backingChain === 'main' ? `${formatCoin(o.initiatorB110Amount)} B110` : `${formatCoin(o.acceptorBtcAmount)} BTC`}
                             </span>
                           </div>
                         </div>
@@ -4387,13 +4442,13 @@ export default function App() {
                           <div>
                             <span className="text-slate-400 block font-medium">You Receive</span>
                             <span className="font-semibold text-sky-400">
-                              {o.backingChain === 'main' ? `${(o.acceptorBtcAmount / 100000000).toFixed(4)} BTC` : `${(o.initiatorB110Amount / 100000000).toFixed(4)} B110`}
+                              {o.backingChain === 'main' ? `${formatCoin(o.acceptorBtcAmount)} BTC` : `${formatCoin(o.initiatorB110Amount)} B110`}
                             </span>
                           </div>
                           <div>
                             <span className="text-slate-400 block font-medium">You Spend</span>
                             <span className="font-semibold text-emerald-400">
-                              {o.backingChain === 'main' ? `${(o.initiatorB110Amount / 100000000).toFixed(4)} B110` : `${(o.acceptorBtcAmount / 100000000).toFixed(4)} BTC`}
+                              {o.backingChain === 'main' ? `${formatCoin(o.initiatorB110Amount)} B110` : `${formatCoin(o.acceptorBtcAmount)} BTC`}
                             </span>
                           </div>
                         </div>
@@ -4475,11 +4530,11 @@ export default function App() {
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 w-full sm:w-auto">
                     <div className="bg-slate-950 border border-slate-850 px-4 py-2.5 rounded-xl text-center">
                       <span className="text-[10px] text-slate-500 uppercase block font-semibold">Sell Volume</span>
-                      <span className="text-sm font-bold text-sky-400">{(selectedOffer.initiatorB110Amount / 100000000).toFixed(4)} B110</span>
+                      <span className="text-sm font-bold text-sky-400">{formatCoin(selectedOffer.initiatorB110Amount)} B110</span>
                     </div>
                     <div className="bg-slate-950 border border-slate-850 px-4 py-2.5 rounded-xl text-center">
                       <span className="text-[10px] text-slate-500 uppercase block font-semibold">Buy Volume</span>
-                      <span className="text-sm font-bold text-emerald-400">{(selectedOffer.acceptorBtcAmount / 100000000).toFixed(4)} BTC</span>
+                      <span className="text-sm font-bold text-emerald-400">{formatCoin(selectedOffer.acceptorBtcAmount)} BTC</span>
                     </div>
                     <div className="bg-slate-950 border border-slate-850 px-4 py-2.5 rounded-xl text-center">
                       <span className="text-[10px] text-slate-500 uppercase block font-semibold">Refund Height (T / T/2)</span>
@@ -4676,7 +4731,7 @@ export default function App() {
                                 <p className="text-[10px] text-slate-400 font-mono mt-2 bg-slate-900 border border-slate-850 p-2.5 rounded-lg leading-normal">
                                   <span className="block font-semibold text-slate-300 mb-1">Preferred Backing Input:</span>
                                   TxID: {utxo.txid.substring(0, 12)}...{utxo.txid.substring(52)}:{utxo.vout}<br />
-                                  Amount: {(utxo.amount / 100000000).toFixed(4)} {isBtcBacking ? 'BTC' : 'B110'}<br />
+                                  Amount: {formatCoin(utxo.amount)} {isBtcBacking ? 'BTC' : 'B110'}<br />
                                   Address: {utxo.address || 'Split contract / ownAddress'}<br />
                                   <span className="text-slate-500">Additional split UTXOs are selected automatically when required.</span>
                                 </p>
@@ -4731,7 +4786,7 @@ export default function App() {
                                 <p className="text-[10px] text-slate-400 font-mono mt-2 bg-slate-900 border border-slate-850 p-2.5 rounded-lg leading-normal">
                                   <span className="block font-semibold text-slate-300 mb-1">Spending Split UTXO:</span>
                                   TxID: {utxo.txid.substring(0, 12)}...{utxo.txid.substring(52)}:{utxo.vout}<br />
-                                  Amount: {(utxo.amount / 100000000).toFixed(4)} {isBtcBacking ? 'B110' : 'BTC'}<br />
+                                  Amount: {formatCoin(utxo.amount)} {isBtcBacking ? 'B110' : 'BTC'}<br />
                                   Address: {utxo.address || 'Split contract / ownAddress'}
                                 </p>
                               )}
