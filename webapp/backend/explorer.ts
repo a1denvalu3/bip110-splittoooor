@@ -125,20 +125,29 @@ export class MempoolExplorerClient {
         }
     }
 
-    // Esplora outspend lookup. Returns null when the transaction does not
-    // exist on this chain at all (404), meaning the outpoint is chain-exclusive.
+    // Esplora outspend lookup. Returns null when the transaction (or the
+    // output index) does not exist on this chain at all, meaning the outpoint
+    // is chain-exclusive. Uses the plural /outspends endpoint: some esplora
+    // deployments answer the singular /outspend/:vout with 200 {"spent":false}
+    // even for transaction ids they have never seen, which would make a
+    // chain-exclusive outpoint look live and replayable.
     async getOutspend(txid: string, vout: number): Promise<{ spent: boolean; confirmed: boolean } | null> {
         try {
-            const response = await this.http.get(this.api(`/tx/${encodeURIComponent(txid)}/outspend/${vout}`), {
+            const response = await this.http.get(this.api(`/tx/${encodeURIComponent(txid)}/outspends`), {
                 timeout: this.timeoutMs
             });
-            if (typeof response.data?.spent !== 'boolean') {
+            if (!Array.isArray(response.data)) {
                 throw new Error('Explorer returned an invalid outspend response');
             }
-            const confirmed = response.data.spent
-                ? response.data.status?.confirmed === true
+            const outspend = response.data[vout];
+            if (outspend === undefined) return null;
+            if (typeof outspend?.spent !== 'boolean') {
+                throw new Error('Explorer returned an invalid outspend response');
+            }
+            const confirmed = outspend.spent
+                ? outspend.status?.confirmed === true
                 : false;
-            return { spent: response.data.spent, confirmed };
+            return { spent: outspend.spent, confirmed };
         } catch (error) {
             if (error instanceof ExplorerRequestError) throw error;
             const status = (error as AxiosError).response?.status;

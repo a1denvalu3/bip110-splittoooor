@@ -407,4 +407,50 @@ describe('Production Mempool explorer client', () => {
         );
         expect(() => new MempoolExplorerClient('http://localhost:3006')).not.to.throw();
     });
+
+    it('reads outspend status from the plural outspends endpoint', async () => {
+        const requests: string[] = [];
+        const txid = 'ab'.repeat(32);
+        const http = {
+            get: async (url: string) => {
+                requests.push(url);
+                return { data: [
+                    { spent: false },
+                    { spent: true, status: { confirmed: false } },
+                    { spent: true, status: { confirmed: true } }
+                ] };
+            },
+            post: async () => ({ data: '' })
+        } as any;
+        const client = new MempoolExplorerClient('https://explorer.example', http);
+
+        expect(await client.getOutspend(txid, 0)).to.deep.equal({ spent: false, confirmed: false });
+        expect(await client.getOutspend(txid, 1)).to.deep.equal({ spent: true, confirmed: false });
+        expect(await client.getOutspend(txid, 2)).to.deep.equal({ spent: true, confirmed: true });
+        expect(requests).to.deep.equal([
+            `https://explorer.example/api/tx/${txid}/outspends`,
+            `https://explorer.example/api/tx/${txid}/outspends`,
+            `https://explorer.example/api/tx/${txid}/outspends`
+        ]);
+    });
+
+    it('treats a transaction unknown to the explorer as chain-exclusive', async () => {
+        const http = {
+            get: async () => Promise.reject({ message: 'not found', response: { status: 404 } }),
+            post: async () => ({ data: '' })
+        } as any;
+        const client = new MempoolExplorerClient('https://explorer.example', http);
+
+        expect(await client.getOutspend('ab'.repeat(32), 0)).to.equal(null);
+    });
+
+    it('treats an output index beyond the transaction outputs as chain-exclusive', async () => {
+        const http = {
+            get: async () => ({ data: [{ spent: false }] }),
+            post: async () => ({ data: '' })
+        } as any;
+        const client = new MempoolExplorerClient('https://explorer.example', http);
+
+        expect(await client.getOutspend('ab'.repeat(32), 7)).to.equal(null);
+    });
 });
