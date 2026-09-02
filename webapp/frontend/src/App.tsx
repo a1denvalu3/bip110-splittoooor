@@ -2163,6 +2163,12 @@ export default function App() {
       const anchorUtxo = fundingSelection.utxos[0];
       const backingTxid = anchorUtxo.txid;
       const backingVout = anchorUtxo.vout;
+      // The anchor UTXO can live on any derived child index. The offer's
+      // initiator key must be the key that actually owns the anchor, not
+      // whichever address happens to be active in the UI.
+      const anchorKeys = typeof anchorUtxo.index === 'number'
+        ? deriveKeysForIndex(masterPrivateKey, anchorUtxo.index, getNetwork())
+        : { publicKey, privateKey };
 
       let preimageHex = '';
 
@@ -2192,7 +2198,7 @@ export default function App() {
 
       // F2: prove ownership of the initiator key by signing the canonical offer fields.
       const offerFields = {
-        initiatorPubKey: publicKey,
+        initiatorPubKey: anchorKeys.publicKey,
         initiatorB110Amount: Number(newOfferB110),
         acceptorBtcAmount: Number(newOfferBtc),
         hashLock: hashLockHex,
@@ -2203,7 +2209,7 @@ export default function App() {
         numsTweak
       };
       const createMessage = `create-offer:${canonicalStringify(offerFields)}`;
-      const createPair = ECPair.fromPrivateKey(Buffer.from(privateKey, 'hex'));
+      const createPair = ECPair.fromPrivateKey(Buffer.from(anchorKeys.privateKey, 'hex'));
       const signature = Buffer.from(createPair.sign(bitcoin.crypto.sha256(Buffer.from(createMessage)))).toString('hex');
 
       const res = await axios.post(`${API_BASE}/offers`, {
