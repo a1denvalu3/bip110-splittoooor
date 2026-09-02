@@ -731,6 +731,16 @@ app.post('/api/offers', async (req: Request, res: Response) => {
         ].filter((output): output is Buffer => Buffer.isBuffer(output));
         const actualScript = Buffer.from(backingTx.outs[vout].script);
         if (!expectedOutputs.some(expected => actualScript.equals(expected))) {
+            logWarn('offer.backing_script_mismatch', {
+                requestId: res.locals.requestId,
+                backingTxid,
+                backingVout,
+                backingChain,
+                initiatorPubKey,
+                actualScript: actualScript.toString('hex'),
+                expectedSplitScript: expectedOutputs[0]?.toString('hex'),
+                expectedOwnScript: expectedOutputs[1]?.toString('hex')
+            });
             throw new Error('Backing outpoint is not owned by the initiator public key');
         }
     } catch (error: any) {
