@@ -725,12 +725,14 @@ app.post('/api/offers', async (req: Request, res: Response) => {
         const vout = Number(backingVout);
         if (vout >= backingTx.outs.length) throw new Error('Invalid backing output index');
         const initiatorKey = Buffer.from(initiatorPubKey, 'hex');
+        // bitcoinjs-lib v7 payments return Uint8Array, not Buffer: do not use
+        // Buffer.isBuffer as a guard here, it would discard both candidates.
         const expectedOutputs = [
             PureBitcoinSwap.createSplitPayment(initiatorKey, network).payment.output,
             PureBitcoinSwap.createOwnPayment(initiatorKey, network).payment.output
-        ].filter((output): output is Buffer => Buffer.isBuffer(output));
+        ].filter((output): output is Uint8Array => !!output);
         const actualScript = Buffer.from(backingTx.outs[vout].script);
-        if (!expectedOutputs.some(expected => actualScript.equals(expected))) {
+        if (!expectedOutputs.some(expected => actualScript.equals(Buffer.from(expected)))) {
             logWarn('offer.backing_script_mismatch', {
                 requestId: res.locals.requestId,
                 backingTxid,
@@ -738,8 +740,8 @@ app.post('/api/offers', async (req: Request, res: Response) => {
                 backingChain,
                 initiatorPubKey,
                 actualScript: actualScript.toString('hex'),
-                expectedSplitScript: expectedOutputs[0]?.toString('hex'),
-                expectedOwnScript: expectedOutputs[1]?.toString('hex')
+                expectedSplitScript: expectedOutputs[0] ? Buffer.from(expectedOutputs[0]).toString('hex') : undefined,
+                expectedOwnScript: expectedOutputs[1] ? Buffer.from(expectedOutputs[1]).toString('hex') : undefined
             });
             throw new Error('Backing outpoint is not owned by the initiator public key');
         }

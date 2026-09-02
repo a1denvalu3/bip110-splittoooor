@@ -224,6 +224,25 @@ describe('Pure Bitcoinjs-Lib Optimized Swap Tests', () => {
         }
     });
 
+    it('5e. Backing ownership check accepts both split and own address script forms', () => {
+        // Pinned to a real mainnet incident (2026-09-02): this key's own-address
+        // output was rejected as collateral.
+        const key = Buffer.from('0234f0ebf2e22243ab2f7e378ef0898d1c177e986568a6bee2f3c027b5353ad093', 'hex');
+        const ownOutput = PureBitcoinSwap.createOwnPayment(key, bitcoin.networks.bitcoin).payment.output!;
+        const splitOutput = PureBitcoinSwap.createSplitPayment(key, bitcoin.networks.bitcoin).payment.output!;
+        const ownHex = '51205b62542b3f71b1c24d143cdf79a0c22e3a21b00935a9c44515204d9dad056ec3';
+        const splitHex = '51204af977e2ada8d13e9ffd31d5a663f46f373e632f74281dd2cd1d90b726bb87a0';
+        expect(Buffer.from(ownOutput).toString('hex')).to.equal(ownHex);
+        expect(Buffer.from(splitOutput).toString('hex')).to.equal(splitHex);
+
+        // bitcoinjs-lib v7 payments return Uint8Array, not Buffer. The
+        // server-side ownership check must compare via Buffer.from(...) and
+        // must never use Buffer.isBuffer as a filter guard.
+        const onChain = Buffer.from(ownHex, 'hex');
+        const candidates = [splitOutput, ownOutput].filter(output => !!output);
+        expect(candidates.some(expected => onChain.equals(Buffer.from(expected)))).to.be.true;
+    });
+
     it('6. Multi-input Taproot HTLC Funding should build a valid transaction with multiple signed inputs', () => {
         const recipientKeyPair = PureBitcoinSwap.generateKeyPair();
         const recipientPubKey = Buffer.from(recipientKeyPair.publicKey);
