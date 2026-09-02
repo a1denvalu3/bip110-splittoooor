@@ -715,15 +715,23 @@ app.post('/api/offers', async (req: Request, res: Response) => {
     try { await assertConfirmedChainExclusiveOutpoint(backingTxid, Number(backingVout), backingChain); }
     catch (error: any) { return res.status(400).json({ error: `Unsafe backing transaction: ${error.message}` }); }
 
-    // The backing outpoint must be a split output owned by the initiator key.
+    // The backing outpoint must be owned by the initiator key. Both forms are
+    // valid collateral: the script-path split address (pre-split deposits) and
+    // the plain key-path own address (where SIGHASH_UNIFIED split proceeds and
+    // cold withdrawals actually land).
     try {
         const network = NETWORK_MODE === 'mainnet' ? bitcoin.networks.bitcoin : bitcoin.networks.regtest;
         const backingTx = bitcoin.Transaction.fromHex(await getRawTransaction(backingTxid, backingChain));
         const vout = Number(backingVout);
         if (vout >= backingTx.outs.length) throw new Error('Invalid backing output index');
-        const expectedOutput = PureBitcoinSwap.createSplitPayment(Buffer.from(initiatorPubKey, 'hex'), network).payment.output;
-        if (!expectedOutput || !Buffer.from(backingTx.outs[vout].script).equals(Buffer.from(expectedOutput))) {
-            throw new Error('Backing outpoint is not a split output owned by the initiator public key');
+        const initiatorKey = Buffer.from(initiatorPubKey, 'hex');
+        const expectedOutputs = [
+            PureBitcoinSwap.createSplitPayment(initiatorKey, network).payment.output,
+            PureBitcoinSwap.createOwnPayment(initiatorKey, network).payment.output
+        ].filter((output): output is Buffer => Buffer.isBuffer(output));
+        const actualScript = Buffer.from(backingTx.outs[vout].script);
+        if (!expectedOutputs.some(expected => actualScript.equals(expected))) {
+            throw new Error('Backing outpoint is not owned by the initiator public key');
         }
     } catch (error: any) {
         return res.status(400).json({ error: `Invalid backing outpoint: ${error.message}` });

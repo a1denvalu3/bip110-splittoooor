@@ -178,6 +178,16 @@ export class PureBitcoinSwap {
         return { payment, script, leafHash };
     }
 
+    // Plain key-path P2TR payment to the owner's key (no script tree). Split
+    // proceeds and cold withdrawals land on this address form.
+    static createOwnPayment(ownerPubKey: Buffer, network: bitcoin.Network = bitcoin.networks.regtest) {
+        const payment = bitcoin.payments.p2tr({
+            internalPubkey: this.getXOnlyPubKey(ownerPubKey),
+            network
+        });
+        return { payment };
+    }
+
     /**
      * Builds and signs a BLAKE2b-chain split spend using SIGHASH_UNIFIED.
      * Bitcoin nodes do not recognize the 0x20 opt-in bit and reject this
