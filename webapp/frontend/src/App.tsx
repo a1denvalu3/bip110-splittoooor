@@ -163,6 +163,8 @@ interface Offer {
   backingTxid?: string;
   backingVout?: number;
   backingChain?: 'main' | 'bip110';
+  acceptorFundingTxid?: string;
+  acceptorFundingVout?: number;
   isPending?: boolean;
   acceptorClaimed?: boolean;
 }
@@ -468,6 +470,27 @@ export default function App() {
     const all = [...marketplaceOffers, ...myCreatedOffers, ...myAcceptedOffers];
     return all.filter((v, i, a) => a.findIndex(t => t.id === v.id) === i);
   }, [marketplaceOffers, myCreatedOffers, myAcceptedOffers]);
+
+  // Outpoints committed to live (non-terminal) offers, keyed like the withdraw
+  // selector (`chain|txid|vout`). Spending one would rug the counterparty, so
+  // these are excluded from withdrawal. The backend sweeper drops rugged offers,
+  // which frees the outpoint here on the next poll.
+  const offerCommittedUtxoKeys = React.useMemo(() => {
+    const LIVE_STATUSES = ['OPEN', 'ACCEPTED', 'FUNDED_INITIATOR', 'FUNDED_ACCEPTOR'];
+    const keys = new Set<string>();
+    for (const o of myCreatedOffers) {
+      if (LIVE_STATUSES.includes(o.status) && o.backingChain && o.backingTxid && o.backingVout !== undefined) {
+        keys.add(`${o.backingChain}|${o.backingTxid}|${o.backingVout}`);
+      }
+    }
+    for (const o of myAcceptedOffers) {
+      if (LIVE_STATUSES.includes(o.status) && o.backingChain && o.acceptorFundingTxid && o.acceptorFundingVout !== undefined) {
+        const acceptorChain = o.backingChain === 'main' ? 'bip110' : 'main';
+        keys.add(`${acceptorChain}|${o.acceptorFundingTxid}|${o.acceptorFundingVout}`);
+      }
+    }
+    return keys;
+  }, [myCreatedOffers, myAcceptedOffers]);
   
   // Offer Form
   const [newOfferB110, setNewOfferB110] = useState<string>(''); // Auto-calculated from split UTXO
@@ -1729,7 +1752,9 @@ export default function App() {
     offersFetchInFlightRef.current = true;
     try {
       const wantsMarketplace = activeTab === 'marketplace' || activeTab === 'wizard';
-      const wantsPersonalOffers = activeTab === 'my-offers' || activeTab === 'wizard';
+      // The wallet tab needs personal offers too: they define which UTXOs are
+      // locked as offer collateral and must be hidden from the withdraw panel.
+      const wantsPersonalOffers = activeTab === 'my-offers' || activeTab === 'wizard' || activeTab === 'wallet';
       const requests: Promise<void>[] = [];
 
       if (wantsMarketplace) {
@@ -2022,6 +2047,9 @@ export default function App() {
     try {
       const [selectedChain, txid, voutStr] = selectedWithdrawUtxoKey.split('|');
       const vout = Number(voutStr);
+      if (offerCommittedUtxoKeys.has(selectedWithdrawUtxoKey)) {
+        throw new Error("This UTXO is committed to a live swap offer. Abort or complete the offer before withdrawing it.");
+      }
       const isMainChain = selectedChain === 'main';
       const chainUtxos = isMainChain ? allMainUtxos : allBip110Utxos;
       const contractUtxos = isMainChain ? mainUtxos : bip110Utxos;
@@ -3560,30 +3588,35 @@ export default function App() {
                     >
                       <option value="">-- Choose a Source UTXO --</option>
                       {/* Main-chain splitAddress outputs */}
-                      {mainUtxos.map(u => (
+                      {mainUtxos.filter(u => !offerCommittedUtxoKeys.has(`main|${u.txid}|${u.vout}`)).map(u => (
                         <option key={`${u.txid}-${u.vout}-split-main`} value={`main|${u.txid}|${u.vout}`}>
                           BTC [Contract Addr] ({formatCoin(u.amount)} BTC | {u.txid.substring(0, 10)}...:{u.vout}) [Addr Index #{u.index !== undefined ? u.index + 1 : 1}]
                         </option>
                       ))}
                       {/* BIP110-chain splitAddress outputs */}
-                      {bip110Utxos.map(u => (
+                      {bip110Utxos.filter(u => !offerCommittedUtxoKeys.has(`bip110|${u.txid}|${u.vout}`)).map(u => (
                         <option key={`${u.txid}-${u.vout}-split-b110`} value={`bip110|${u.txid}|${u.vout}`}>
                           B110 [Contract Addr] ({formatCoin(u.amount)} B110 | {u.txid.substring(0, 10)}...:{u.vout}) [Addr Index #{u.index !== undefined ? u.index + 1 : 1}]
                         </option>
                       ))}
                       {/* Main-chain ownAddress outputs */}
-                      {ownMainUtxos.map(u => (
+                      {ownMainUtxos.filter(u => !offerCommittedUtxoKeys.has(`main|${u.txid}|${u.vout}`)).map(u => (
                         <option key={`${u.txid}-${u.vout}-own-main`} value={`main|${u.txid}|${u.vout}`}>
                           BTC [Own Split Addr] ({formatCoin(u.amount)} BTC | {u.txid.substring(0, 10)}...:{u.vout}) [Addr Index #{u.index !== undefined ? u.index + 1 : 1}]
                         </option>
                       ))}
                       {/* BIP110-chain ownAddress outputs */}
-                      {ownBip110Utxos.map(u => (
+                      {ownBip110Utxos.filter(u => !offerCommittedUtxoKeys.has(`bip110|${u.txid}|${u.vout}`)).map(u => (
                         <option key={`${u.txid}-${u.vout}-own-b110`} value={`bip110|${u.txid}|${u.vout}`}>
                           B110 [Own Split Addr] ({formatCoin(u.amount)} B110 | {u.txid.substring(0, 10)}...:{u.vout}) [Addr Index #{u.index !== undefined ? u.index + 1 : 1}]
                         </option>
                       ))}
                     </select>
+                    {offerCommittedUtxoKeys.size > 0 && (
+                      <p className="mt-2 text-[11px] leading-relaxed text-amber-400/80">
+                        {offerCommittedUtxoKeys.size} UTXO{offerCommittedUtxoKeys.size === 1 ? ' is' : 's are'} committed to live swap offers and cannot be withdrawn until those offers complete or are aborted.
+                      </p>
+                    )}
                   </div>
 
                   <div>

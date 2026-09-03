@@ -24,6 +24,8 @@ import {
     updateOfferFieldsById,
     deleteOfferById,
     walkbackAcceptanceById,
+    getLiveOffersForRevalidation,
+    unacceptOfferIfAccepted,
     DbOffer as Offer
 } from './database/offersCrud';
 
@@ -45,6 +47,7 @@ const EXPLORER_CACHE_TTL = {
     rawTransaction: cacheTtl('EXPLORER_RAW_TX_CACHE_SECONDS', 86400),
     fees: cacheTtl('EXPLORER_FEE_CACHE_SECONDS', 60)
 };
+const OFFER_REVALIDATION_INTERVAL_MS = cacheTtl('OFFER_REVALIDATION_INTERVAL_SECONDS', 120) * 1000;
 
 // The production backend is exactly one hop behind nginx. This also covers the
 // Docker bridge address seen when nginx proxies to a loopback-published port.
@@ -577,6 +580,83 @@ function fundingChainFor(offer: Offer, signer: 'initiator' | 'acceptor'): Explor
     return offer.backingChain === 'main' ? 'bip110' : 'main';
 }
 
+// Definitive "is this outpoint still spendable on this chain" lookup. Unlike the
+// creation-time replay check, mempool spends count as spent here: an in-flight
+// spend means the promised collateral is on its way out. Lookup failures throw
+// so callers skip rather than act on inconclusive data.
+async function isOutpointUnspentOnChain(txid: string, vout: number, chain: ExplorerChain): Promise<boolean> {
+    if (NETWORK_MODE === 'regtest') {
+        const rpc = chain === 'bip110' ? bip110MinerRpc : mainMinerRpc;
+        return (await rpc.call('gettxout', [txid, vout])) !== null;
+    }
+    const rpc = getProductionRpc(chain);
+    if (rpc) return (await rpc.call('gettxout', [txid, vout])) !== null;
+    const outspend = await getMainnetExplorer(chain).getOutspend(txid, vout);
+    return outspend !== null && !outspend.spent;
+}
+
+// Periodic re-validation of every live offer's promised outpoints. A backing
+// outpoint spent while OPEN/ACCEPTED means the initiator rugged the offer, so
+// it is removed; an acceptor funding outpoint spent while ACCEPTED rolls the
+// offer back to OPEN. Funded states are governed by the on-chain HTLCs and are
+// intentionally left alone.
+async function revalidateOfferOutpoints(offer: Offer): Promise<void> {
+    if (!offer.backingTxid || offer.backingVout === null || offer.backingVout === undefined || !offer.backingChain) return;
+    try {
+        const backingUnspent = await isOutpointUnspentOnChain(offer.backingTxid, Number(offer.backingVout), offer.backingChain);
+        if (!backingUnspent) {
+            const changes = await deleteOfferById(offer.id);
+            if (changes > 0) {
+                logWarn('offer.revalidation_removed', {
+                    id: offer.id,
+                    networkMode: NETWORK_MODE,
+                    reason: 'backing outpoint spent',
+                    backingTxid: offer.backingTxid,
+                    backingVout: offer.backingVout,
+                    backingChain: offer.backingChain
+                });
+            }
+            return;
+        }
+        if (offer.status === 'ACCEPTED' && offer.acceptorFundingTxid
+            && offer.acceptorFundingVout !== null && offer.acceptorFundingVout !== undefined) {
+            const acceptorChain: ExplorerChain = offer.backingChain === 'main' ? 'bip110' : 'main';
+            const fundingUnspent = await isOutpointUnspentOnChain(offer.acceptorFundingTxid, Number(offer.acceptorFundingVout), acceptorChain);
+            if (!fundingUnspent) {
+                const changes = await unacceptOfferIfAccepted(offer.id);
+                if (changes > 0) {
+                    logWarn('offer.revalidation_unaccepted', {
+                        id: offer.id,
+                        networkMode: NETWORK_MODE,
+                        reason: 'acceptor funding outpoint spent',
+                        acceptorFundingTxid: offer.acceptorFundingTxid,
+                        acceptorFundingVout: offer.acceptorFundingVout
+                    });
+                }
+            }
+        }
+    } catch (err: any) {
+        logWarn('offer.revalidation_lookup_failed', { id: offer.id, networkMode: NETWORK_MODE, error: err.message });
+    }
+}
+
+let offerRevalidationInFlight = false;
+async function revalidateLiveOffers(): Promise<void> {
+    if (offerRevalidationInFlight) return;
+    offerRevalidationInFlight = true;
+    try {
+        const offers = await getLiveOffersForRevalidation(NETWORK_MODE);
+        // Bound the chain-lookup fan-out: sequential batches of 10.
+        for (let i = 0; i < offers.length; i += 10) {
+            await Promise.all(offers.slice(i, i + 10).map(revalidateOfferOutpoints));
+        }
+    } catch (err: any) {
+        logError('offer.revalidation_sweep_failed', { networkMode: NETWORK_MODE, error: err.message });
+    } finally {
+        offerRevalidationInFlight = false;
+    }
+}
+
 // 1. Get Marketplace Offers
 app.get('/api/offers', async (req: Request, res: Response) => {
     const mode = NETWORK_MODE;
@@ -814,6 +894,18 @@ app.post('/api/offers/:id/accept', async (req: Request, res: Response) => {
         }
         if (!offer.backingChain) {
             return res.status(400).json({ error: "Offer has no backing chain" });
+        }
+
+        // The initiator's promised backing outpoint must still be unspent;
+        // creation-time validation alone cannot catch a later rug.
+        if (offer.backingTxid && offer.backingVout !== null && offer.backingVout !== undefined) {
+            try {
+                if (!await isOutpointUnspentOnChain(offer.backingTxid, Number(offer.backingVout), offer.backingChain)) {
+                    return res.status(400).json({ error: 'The UTXO backing this offer has already been spent' });
+                }
+            } catch (lookupErr: any) {
+                return res.status(503).json({ error: 'Could not verify the offer backing UTXO right now; try again shortly' });
+            }
         }
 
         const messageHash = bitcoin.crypto.sha256(Buffer.from(`accept-offer:${id}:${acceptorPubKey}:${acceptorFundingTxid}:${acceptorFundingVout}`));
@@ -1634,6 +1726,11 @@ async function startServer() {
     app.listen(PORT, () => {
         console.log(`Server listening on http://localhost:${PORT}`);
     });
+
+    // Re-validate live offers' promised outpoints on an interval (and once at
+    // boot) so rugged backing/funding UTXOs do not linger in the marketplace.
+    setInterval(() => { revalidateLiveOffers().catch(() => undefined); }, OFFER_REVALIDATION_INTERVAL_MS).unref();
+    revalidateLiveOffers().catch(() => undefined);
 }
 
 startServer().catch((error: any) => {

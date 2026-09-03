@@ -187,6 +187,21 @@ export async function updateOfferFieldsById(id: string, fields: Partial<DbOffer>
     return result.changes;
 }
 
+export async function getLiveOffersForRevalidation(mode: 'mainnet' | 'regtest'): Promise<DbOffer[]> {
+    return dbAll(
+        "SELECT * FROM offers WHERE networkMode = ? AND status IN ('OPEN', 'ACCEPTED')",
+        [mode]
+    );
+}
+
+export async function unacceptOfferIfAccepted(id: string): Promise<number> {
+    const result = await dbRun(
+        "UPDATE offers SET status = 'OPEN', acceptorPubKey = NULL, acceptorFundingTxid = NULL, acceptorFundingVout = NULL WHERE id = ? AND status = 'ACCEPTED'",
+        [id]
+    );
+    return result.changes;
+}
+
 export async function deleteOfferById(id: string): Promise<number> {
     const result = await dbRun("DELETE FROM offers WHERE id = ? AND status IN ('OPEN', 'ACCEPTED')", [id]);
     return result.changes;
