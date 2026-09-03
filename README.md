@@ -111,11 +111,9 @@ http://localhost:3000
   4. **Tab 4: My Swaps & Offers**: Monitor your listings, delete outstanding listings, walk back acceptances, or accept your own listing as a counterparty (by generating a new active P2TR address in Tab 1!).
   5. **Tab 5: Swap Wizard**: Orchestrate the end-to-end atomic swap using the step-by-step visual workflow to fund escrows, extract revealed preimages, settle claims, or simulate expired refund scripts.
 
-### Relaying a Wallet Transaction to BIP110
+### Replaying a Transaction on the Other Chain
 
-After the networks have separated, a wallet may broadcast a transaction only to Bitcoin even though the same pre-split inputs remain spendable on BIP110. In **Unified Wallet**, expand **Relay a Transaction to BIP110**, copy the signed raw transaction hex from the wallet, review the locally decoded transaction ID and size, and submit it. The backend relays it only to the BIP110 chain: through the Knots RPC node in regtest, or the configured BIP110 RPC/Esplora source in mainnet mode.
-
-The relay accepts canonical serialized transaction hex, not a PSBT, private key, seed phrase, or wallet file. The BIP110 node still performs all normal consensus and mempool-policy validation.
+After the networks have separated, a wallet may broadcast a transaction only to one side even though the same pre-split inputs remain spendable on both. In **Unified Wallet**, the **Confirmed UTXO Ledger** shows an arrow button next to every chain-exclusive (🛡️ Split) UTXO: → on Bitcoin entries replays the transaction that created them on the BIP110 network, and ← on BIP110 entries replays it on the Bitcoin network. The app fetches the raw transaction from the chain where it exists and broadcasts it unchanged to the other side, then refreshes the ledger. The receiving node still performs all normal consensus and mempool-policy validation, so a replay fails harmlessly if the inputs no longer exist there.
 
 ## Production Mainnet Chain Data Configuration
 
