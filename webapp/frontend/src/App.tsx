@@ -485,10 +485,8 @@ export default function App() {
   const [withdrawAmountSats, setWithdrawAmountSats] = useState<string>('');
   const [withdrawing, setWithdrawing] = useState<boolean>(false);
 
-  // BIP110 raw transaction relay state
-  const [relayTransactionHex, setRelayTransactionHex] = useState<string>('');
-  const [relaySubmitting, setRelaySubmitting] = useState<boolean>(false);
-  const [relayResult, setRelayResult] = useState<{ txid: string } | null>(null);
+  // Cross-chain transaction replay state, keyed by `${sourceChain}:${txid}`
+  const [replayStates, setReplayStates] = useState<Record<string, { status: 'loading' | 'success' | 'error'; message?: string }>>({});
 
   // Toast notifications
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
@@ -1437,47 +1435,55 @@ export default function App() {
     setTimeout(() => setToast(null), 5000);
   };
 
-  const relayPreview = React.useMemo(() => {
-    const hex = relayTransactionHex.trim();
-    if (!hex) return null;
-    if (!/^[0-9a-fA-F]+$/.test(hex) || hex.length % 2 !== 0) {
-      return { error: 'Enter an even number of hexadecimal characters.' } as const;
-    }
+  const replayTransaction = async (txid: string, sourceChain: 'main' | 'bip110') => {
+    const targetChain: 'main' | 'bip110' = sourceChain === 'main' ? 'bip110' : 'main';
+    const targetLabel = targetChain === 'main' ? 'Bitcoin' : 'BIP110';
+    const key = `${sourceChain}:${txid}`;
+    setReplayStates(prev => ({ ...prev, [key]: { status: 'loading' } }));
     try {
-      const tx = bitcoin.Transaction.fromHex(hex);
-      return {
-        txid: tx.getId(),
-        bytes: tx.byteLength(),
-        virtualSize: tx.virtualSize(),
-        inputs: tx.ins.length,
-        outputs: tx.outs.length
-      } as const;
-    } catch {
-      return { error: 'This is not a decodable raw Bitcoin transaction.' } as const;
-    }
-  }, [relayTransactionHex]);
-
-  const submitBip110Transaction = async (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!relayPreview || 'error' in relayPreview) {
-      showToast('Paste a valid signed raw transaction first.', 'error');
-      return;
-    }
-
-    setRelaySubmitting(true);
-    setRelayResult(null);
-    try {
-      const response = await axios.post(`${API_BASE}/tx/bip110/submit`, {
-        hex: relayTransactionHex.trim()
-      });
-      setRelayResult({ txid: response.data.txid });
-      showToast('Transaction accepted by the BIP110 relay.', 'success');
+      const rawRes = await axios.get(`${API_BASE}/tx/raw`, { params: { txid, chain: sourceChain } });
+      const broadcastRes = await axios.post(`${API_BASE}/tx/broadcast`, { hex: rawRes.data.hex, chain: targetChain });
+      setReplayStates(prev => ({ ...prev, [key]: { status: 'success' } }));
+      showToast(`Transaction replayed to the ${targetLabel} network (${broadcastRes.data.txid}).`, 'success');
+      fetchBalances();
     } catch (err: any) {
       const message = err.response?.data?.error || err.message;
-      showToast(`BIP110 relay rejected the transaction: ${message}`, 'error');
-    } finally {
-      setRelaySubmitting(false);
+      setReplayStates(prev => ({ ...prev, [key]: { status: 'error', message } }));
+      showToast(`Replay to ${targetLabel} failed: ${message}`, 'error');
     }
+  };
+
+  const renderReplayButton = (u: UTXO, sourceChain: 'main' | 'bip110') => {
+    const targetChain = sourceChain === 'main' ? 'bip110' : 'main';
+    const targetLabel = targetChain === 'main' ? 'Bitcoin' : 'BIP110';
+    const key = `${sourceChain}:${u.txid}`;
+    const state = replayStates[key];
+    const Arrow = sourceChain === 'main' ? ArrowRight : ArrowLeft;
+    return (
+      <button
+        type="button"
+        onClick={() => replayTransaction(u.txid, sourceChain)}
+        disabled={state?.status === 'loading'}
+        title={state?.status === 'error'
+          ? `Replay to ${targetLabel} failed: ${state.message} — click to retry`
+          : `Replay this transaction on the ${targetLabel} network`}
+        className={`shrink-0 rounded-lg border p-1 transition disabled:cursor-wait ${
+          state?.status === 'success'
+            ? 'border-emerald-800/50 bg-emerald-950/30 text-emerald-400'
+            : state?.status === 'error'
+              ? 'border-rose-800/50 bg-rose-950/30 text-rose-400 hover:bg-rose-950/50'
+              : 'border-slate-800 bg-slate-900/60 text-slate-400 hover:border-slate-600 hover:text-slate-200'
+        }`}
+      >
+        {state?.status === 'loading'
+          ? <RefreshCw className="h-3 w-3 animate-spin" />
+          : state?.status === 'success'
+            ? <Check className="h-3 w-3" />
+            : state?.status === 'error'
+              ? <AlertTriangle className="h-3 w-3" />
+              : <Arrow className="h-3 w-3" />}
+      </button>
+    );
   };
 
   const handleDownloadRecoveryFile = async () => {
@@ -3451,7 +3457,10 @@ export default function App() {
                                   </span>
                                 )}
                               </div>
-                              <span className="font-semibold text-emerald-400">{formatCoin(u.amount)} BTC</span>
+                              <div className="flex items-center gap-2">
+                                <span className="font-semibold text-emerald-400">{formatCoin(u.amount)} BTC</span>
+                                {isSplit && renderReplayButton(u, 'main')}
+                              </div>
                             </div>
                           );
                         })}
@@ -3498,7 +3507,10 @@ export default function App() {
                                   </span>
                                 )}
                               </div>
-                              <span className="font-semibold text-sky-400">{formatCoin(u.amount)} B110</span>
+                              <div className="flex items-center gap-2">
+                                <span className="font-semibold text-sky-400">{formatCoin(u.amount)} B110</span>
+                                {isSplit && renderReplayButton(u, 'bip110')}
+                              </div>
                             </div>
                           )
                         })}
@@ -3640,117 +3652,6 @@ export default function App() {
                   </div>
                 </div>
               </form>
-            </CollapsibleCard>
-
-            {/* BIP110 RAW TRANSACTION RELAY */}
-            <CollapsibleCard
-              title="Relay a Transaction to BIP110"
-              icon={Globe}
-              defaultOpen={false}
-            >
-              <div className="space-y-6 pt-2">
-            <section className="relative overflow-hidden rounded-2xl border border-sky-500/30 bg-slate-950 shadow-2xl shadow-sky-950/20">
-              <div className="absolute inset-y-0 left-0 w-1.5 bg-gradient-to-b from-sky-300 via-cyan-400 to-emerald-400" />
-              <div className="p-6 pl-8 sm:p-8 sm:pl-10">
-                <div className="mb-7 flex items-start gap-4">
-                  <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-sky-400/30 bg-sky-400/10">
-                    <Globe className="h-5 w-5 text-sky-300" />
-                  </div>
-                  <div>
-                    <span className="mb-2 inline-block rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1 text-[10px] font-black uppercase tracking-[0.18em] text-sky-300">
-                      BIP110 broadcast utility
-                    </span>
-                    <h2 className="text-xl font-bold tracking-tight text-white sm:text-2xl">Relay a signed transaction to Knots</h2>
-                    <p className="mt-2 max-w-2xl text-sm leading-relaxed text-slate-400">
-                      If your wallet broadcast only to Bitcoin after the chains separated, paste the same signed raw transaction here to submit it directly to the BIP110 network.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="mb-6 grid gap-3 sm:grid-cols-3">
-                  {[
-                    ['1', 'Create and sign', 'Use your existing wallet'],
-                    ['2', 'Copy raw hex', 'Do not paste a PSBT'],
-                    ['3', 'Relay to BIP110', networkMode === 'regtest' ? 'Via local Knots RPC' : 'Via the configured Knots source']
-                  ].map(([number, title, detail]) => (
-                    <div key={number} className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-                      <span className="text-[10px] font-black tracking-widest text-sky-400">STEP {number}</span>
-                      <strong className="mt-1 block text-xs text-slate-200">{title}</strong>
-                      <span className="mt-1 block text-[11px] text-slate-500">{detail}</span>
-                    </div>
-                  ))}
-                </div>
-
-                <form onSubmit={submitBip110Transaction} className="space-y-4">
-                  <div>
-                    <label htmlFor="bip110-raw-transaction" className="mb-2 block text-xs font-bold uppercase tracking-wider text-slate-400">
-                      Signed raw transaction hex
-                    </label>
-                    <textarea
-                      id="bip110-raw-transaction"
-                      value={relayTransactionHex}
-                      onChange={(event) => {
-                        setRelayTransactionHex(event.target.value);
-                        setRelayResult(null);
-                      }}
-                      spellCheck={false}
-                      autoComplete="off"
-                      rows={8}
-                      placeholder="020000000001..."
-                      className="w-full resize-y rounded-xl border border-slate-800 bg-black/35 px-4 py-3 font-mono text-xs leading-6 text-sky-200 outline-none transition focus:border-sky-500/70 focus:ring-2 focus:ring-sky-500/10"
-                    />
-                    <p className="mt-2 text-[11px] leading-relaxed text-slate-500">
-                      Raw transaction hex is the canonical serialized transaction produced after signing. Private keys, seed phrases, wallet files, and PSBTs are never required.
-                    </p>
-                  </div>
-
-                  {relayPreview && (
-                    'error' in relayPreview ? (
-                      <div className="flex items-center gap-2 rounded-xl border border-rose-500/25 bg-rose-500/10 px-4 py-3 text-xs text-rose-300">
-                        <AlertTriangle className="h-4 w-4 shrink-0" /> {relayPreview.error}
-                      </div>
-                    ) : (
-                      <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/[0.06] p-4">
-                        <div className="mb-3 flex items-center gap-2 text-xs font-bold text-emerald-300">
-                          <CheckCircle className="h-4 w-4" /> Transaction decoded locally
-                        </div>
-                        <dl className="grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
-                          <div><dt className="text-slate-500">Size</dt><dd className="mt-1 font-mono text-slate-200">{relayPreview.bytes} bytes</dd></div>
-                          <div><dt className="text-slate-500">Virtual size</dt><dd className="mt-1 font-mono text-slate-200">{relayPreview.virtualSize} vB</dd></div>
-                          <div><dt className="text-slate-500">Inputs</dt><dd className="mt-1 font-mono text-slate-200">{relayPreview.inputs}</dd></div>
-                          <div><dt className="text-slate-500">Outputs</dt><dd className="mt-1 font-mono text-slate-200">{relayPreview.outputs}</dd></div>
-                        </dl>
-                        <div className="mt-3 border-t border-emerald-500/10 pt-3">
-                          <span className="text-[10px] uppercase tracking-wider text-slate-500">Expected TXID</span>
-                          <code className="mt-1 block break-all text-[11px] text-emerald-200">{relayPreview.txid}</code>
-                        </div>
-                      </div>
-                    )
-                  )}
-
-                  {relayResult && (
-                    <div className="rounded-xl border border-sky-400/30 bg-sky-400/10 p-4 text-sm text-sky-100">
-                      <strong className="flex items-center gap-2"><CheckCircle className="h-4 w-4" /> Accepted by BIP110</strong>
-                      <code className="mt-2 block break-all text-xs text-sky-200">{relayResult.txid}</code>
-                    </div>
-                  )}
-
-                  <button
-                    type="submit"
-                    disabled={relaySubmitting || !relayPreview || 'error' in relayPreview}
-                    className="flex w-full items-center justify-center gap-2 rounded-xl bg-sky-500 px-5 py-3 text-sm font-black text-slate-950 shadow-lg shadow-sky-500/10 transition hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-35"
-                  >
-                    {relaySubmitting ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Globe className="h-4 w-4" />}
-                    {relaySubmitting ? 'Submitting to BIP110…' : 'Submit to BIP110 network'}
-                  </button>
-                </form>
-              </div>
-            </section>
-
-            <div className="rounded-xl border border-amber-500/20 bg-amber-500/[0.06] px-5 py-4 text-xs leading-relaxed text-amber-100/80">
-              <strong className="text-amber-300">Before submitting:</strong> verify the transaction spends the intended inputs and pays the intended outputs. The relay broadcasts exactly what you paste and cannot reverse a confirmed transaction.
-            </div>
-              </div>
             </CollapsibleCard>
           </div>
         )}
